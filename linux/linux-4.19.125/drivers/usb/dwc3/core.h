@@ -30,7 +30,9 @@
 #include <linux/phy/phy.h>
 
 #ifdef CONFIG_ARCH_AXERA
+#ifndef CONFIG_USB_DWC3_AXERA
 #define CONFIG_USB_DWC3_AXERA
+#endif
 #endif
 
 #define DWC3_MSG_MAX	500
@@ -139,6 +141,7 @@
 #define DWC3_GEVNTCOUNT(n)	(0xc40c + ((n) * 0x10))
 
 #define DWC3_GHWPARAMS8		0xc600
+#define DWC3_GUCTL3		0xc60c
 #define DWC3_GFLADJ		0xc630
 
 /* Device Registers */
@@ -277,6 +280,7 @@
 
 /* Global USB2 PHY Vendor Control Register */
 #define DWC3_GUSB2PHYACC_NEWREGREQ	BIT(25)
+#define DWC3_GUSB2PHYACC_DONE		BIT(24)
 #define DWC3_GUSB2PHYACC_BUSY		BIT(23)
 #define DWC3_GUSB2PHYACC_WRITE		BIT(22)
 #define DWC3_GUSB2PHYACC_ADDR(n)	(n << 16)
@@ -371,8 +375,12 @@
 #define DWC3_GFLADJ_REFCLK_FLADJ_MASK		0x3fff
 #define DWC3_GFLADJ_REFCLK_240MHZ_DECR_MASK	0x7f
 
+
 /* Global User Control Register 2 */
 #define DWC3_GUCTL2_RST_ACTBITLATER		BIT(14)
+
+/* Global User Control Register 3 */
+#define DWC3_GUCTL3_SPLITDISABLE		BIT(14)
 
 /* Device Configuration Register */
 #define DWC3_DCFG_DEVADDR(addr)	((addr) << 3)
@@ -493,15 +501,9 @@
 #define DWC3_DGCMD_RUN_SOC_BUS_LOOPBACK	0x10
 
 /// SIPEED EDIT ///
-/**
- * https://patches.linaro.org/project/linux-usb/list/?series=205060
- * Message ID 	1679694482-16430-5-git-send-email-quic_eserrao@quicinc.com
- * Series 	Add function suspend/resume and remote wakeup support
- *
- * [v13,4/6] usb: dwc3: Add function suspend and function wakeup support
- */
 #define DWC3_DGCMD_DEV_NOTIFICATION	0x07
 /// SIPEED EDIT END ///
+
 
 #define DWC3_DGCMD_STATUS(n)		(((n) >> 12) & 0x0F)
 #define DWC3_DGCMD_CMDACT		BIT(10)
@@ -516,16 +518,10 @@
 #define DWC3_DGCMDPAR_LOOPBACK_ENA		BIT(0)
 
 /// SIPEED EDIT ///
-/**
- * https://patches.linaro.org/project/linux-usb/list/?series=205060
- * Message ID 	1679694482-16430-5-git-send-email-quic_eserrao@quicinc.com
- * Series 	Add function suspend/resume and remote wakeup support
- *
- * [v13,4/6] usb: dwc3: Add function suspend and function wakeup support
- */
 #define DWC3_DGCMDPAR_DN_FUNC_WAKE		BIT(0)
 #define DWC3_DGCMDPAR_INTF_SEL(n)		((n) << 4)
 /// SIPEED EDIT END ///
+
 
 /* Device Endpoint Command Register */
 #define DWC3_DEPCMD_PARAM_SHIFT		16
@@ -1039,6 +1035,7 @@ struct dwc3_scratchpad_array {
  * 	2	- No de-emphasis
  * 	3	- Reserved
  * @dis_metastability_quirk: set to disable metastability quirk.
+ * @dis_split_quirk: set to disable split boundary.
  * @imod_interval: set the interrupt moderation interval in 250ns
  *                 increments or 0 to disable.
  */
@@ -1209,17 +1206,11 @@ struct dwc3 {
 	unsigned		tx_de_emphasis:2;
 
 	unsigned		dis_metastability_quirk:1;
-
 /// SIPEED EDIT ///
-	/**
-	 * https://patches.linaro.org/project/linux-usb/list/?series=205060
-	 * Message ID 	1679694482-16430-3-git-send-email-quic_eserrao@quicinc.com
-	 * Series 	Add function suspend/resume and remote wakeup support
-	 * 
-	 * [v13,2/6] usb: dwc3: Add remote wakeup handling
-	 */
 	unsigned wakeup_configured:1;
 /// SIPEED EDIT END ///
+
+	unsigned		dis_split_quirk:1;
 
 	u16			imod_interval;
 };
@@ -1469,7 +1460,6 @@ static inline void dwc3_otg_host_init(struct dwc3 *dwc)
 #if !IS_ENABLED(CONFIG_USB_DWC3_HOST)
 int dwc3_gadget_suspend(struct dwc3 *dwc);
 int dwc3_gadget_resume(struct dwc3 *dwc);
-void dwc3_gadget_process_pending_events(struct dwc3 *dwc);
 #else
 static inline int dwc3_gadget_suspend(struct dwc3 *dwc)
 {
@@ -1481,9 +1471,6 @@ static inline int dwc3_gadget_resume(struct dwc3 *dwc)
 	return 0;
 }
 
-static inline void dwc3_gadget_process_pending_events(struct dwc3 *dwc)
-{
-}
 #endif /* !IS_ENABLED(CONFIG_USB_DWC3_HOST) */
 
 #if IS_ENABLED(CONFIG_USB_DWC3_ULPI)
