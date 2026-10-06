@@ -488,6 +488,16 @@ static int ax_wdt_drv_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static void ax_wdt_drv_shutdown(struct platform_device *pdev)
+{
+	struct ax_wdt *ax_wdt = platform_get_drvdata(pdev);
+
+	if (ax_wdt) {
+		ax_wdt_enable(ax_wdt, 0);
+		ax_wdt_clk_disable(ax_wdt);
+	}
+}
+
 #ifdef CONFIG_OF
 static const struct of_device_id ax_wdt_of_match[] = {
 	{.compatible = "axera,ax-wdt",},
@@ -500,6 +510,7 @@ MODULE_DEVICE_TABLE(of, ax_wdt_of_match);
 static struct platform_driver ax_wdt_driver = {
 	.probe = ax_wdt_drv_probe,
 	.remove = ax_wdt_drv_remove,
+	.shutdown = ax_wdt_drv_shutdown,
 	.driver = {
 		   .name = "ax_wdt",
 		   .of_match_table = of_match_ptr(ax_wdt_of_match),

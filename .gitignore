@@ -1,1 +1,25 @@
+# Axera internal scripts
 linux/linux-4.19.125/scripts/axera
+
+# Signed kernel & DTB artifacts
+boot_signed.bin
+*_signed.bin
+*_signed.dtb
+
+# Intermediate compression & tool metadata
+*.axgzip
+*.lz77
+*.json
+linux/linux-4.19.125/arch/arm64/boot/*.axgzip
+linux/linux-4.19.125/arch/arm64/boot/*.lz77
+linux/linux-4.19.125/arch/arm64/boot/*.json
+linux/linux-4.19.125/arch/arm64/boot/dts/axera/*.axgzip
+linux/linux-4.19.125/arch/arm64/boot/dts/axera/*.lz77
+linux/linux-4.19.125/arch/arm64/boot/dts/axera/*.json
+
+# OSAL build objects & module outputs
+osal/linux/kernel/*.o
+osal/linux/kernel/.*.cmd
+osal/linux/kernel/built-in.a
+osal/linux/kernel/modules.order
+osal/linux/kernel/modules.builtin
