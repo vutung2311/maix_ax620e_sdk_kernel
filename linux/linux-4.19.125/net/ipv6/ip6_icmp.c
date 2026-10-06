@@ -81,4 +81,16 @@ out:
 }
 EXPORT_SYMBOL(icmpv6_ndo_send);
 #endif
+
+/*
+ * Compatibility wrapper for precompiled vendor modules (e.g. wireguard.ko)
+ * that expect an exported icmpv6_send symbol.
+ */
+#undef icmpv6_send
+void icmpv6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info)
+{
+	__icmpv6_send(skb, type, code, info, IP6CB(skb));
+}
+EXPORT_SYMBOL(icmpv6_send);
+
 #endif

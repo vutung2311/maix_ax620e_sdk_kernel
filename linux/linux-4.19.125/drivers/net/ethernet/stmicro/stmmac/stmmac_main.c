@@ -2569,9 +2569,6 @@ static int stmmac_hw_setup(struct net_device *dev, bool init_ptp)
 			stmmac_enable_tso(priv, priv->ioaddr, 1, chan);
 	}
 
-	#ifdef CONFIG_DWMAC_AXERA
-	ax_reset_phy(to_platform_device(priv->device), priv->plat->bsp_priv);
-#endif
 
 	/* Start the ball rolling... */
 	stmmac_start_all_dma(priv);
@@ -2600,6 +2597,10 @@ static int stmmac_open(struct net_device *dev)
 	struct stmmac_priv *priv = netdev_priv(dev);
 	u32 chan;
 	int ret;
+
+#ifdef CONFIG_DWMAC_AXERA
+	ax_reset_phy(to_platform_device(priv->device), priv->plat->bsp_priv);
+#endif
 
 	if (priv->hw->pcs != STMMAC_PCS_RGMII &&
 	    priv->hw->pcs != STMMAC_PCS_TBI &&
