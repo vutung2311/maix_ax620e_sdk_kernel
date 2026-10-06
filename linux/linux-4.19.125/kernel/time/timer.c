@@ -1423,6 +1423,12 @@ int timer_delete_sync(struct timer_list *timer)
 }
 EXPORT_SYMBOL(timer_delete_sync);
 
+int del_timer_sync(struct timer_list *timer)
+{
+	return timer_delete_sync(timer);
+}
+EXPORT_SYMBOL(del_timer_sync);
+
 static void call_timer_fn(struct timer_list *timer,
 			  void (*fn)(struct timer_list *),
 			  unsigned long baseclk)
