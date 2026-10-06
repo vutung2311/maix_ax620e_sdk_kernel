@@ -1000,7 +1000,6 @@ struct device {
 	struct dev_pin_info	*pins;
 #endif
 #ifdef CONFIG_GENERIC_MSI_IRQ
-	raw_spinlock_t		msi_lock;
 	struct list_head	msi_list;
 #endif
 
@@ -1050,6 +1049,9 @@ struct device {
 	bool			offline_disabled:1;
 	bool			offline:1;
 	bool			of_node_reused:1;
+#ifdef CONFIG_GENERIC_MSI_IRQ
+	raw_spinlock_t		msi_lock;
+#endif
 };
 
 static inline struct device *kobj_to_dev(struct kobject *kobj)
