@@ -12,6 +12,7 @@
 #include <linux/pm.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/reboot.h>
 #include <linux/watchdog.h>
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
@@ -222,7 +223,9 @@ static int ax_wdt_restart(struct watchdog_device *wdd,
 	struct ax_wdt *ax_wdt = to_ax_wdt(wdd);
 	//change clk to 24M, when reboot
 	ax_wdt_clk_enable(ax_wdt, AX_WDT_CLK_24M);
+	ax_wdt_reset_set(ax_wdt, 0);
 	ax_wdt_set_timeout(wdd, 0);
+	ax_wdt_enable(ax_wdt, 1);
 	/* wait for reset to assert... */
 	mdelay(500);
 	return 0;
@@ -491,6 +494,9 @@ static int ax_wdt_drv_remove(struct platform_device *pdev)
 static void ax_wdt_drv_shutdown(struct platform_device *pdev)
 {
 	struct ax_wdt *ax_wdt = platform_get_drvdata(pdev);
+
+	if (system_state == SYSTEM_RESTART)
+		return;
 
 	if (ax_wdt) {
 		ax_wdt_enable(ax_wdt, 0);
