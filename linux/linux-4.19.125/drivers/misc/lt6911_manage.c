@@ -60,6 +60,11 @@ static int force_fps = -1;
 
 void lt6911_force_resolution(u16 width, u16 height, int fps);
 static struct work_struct get_hdmi_info_work;
+static struct delayed_work hdmi_poll_work;
+static void hdmi_poll_handler(struct work_struct *work)
+{
+    schedule_work(&get_hdmi_info_work);
+}
 
 static int force_res_param_set(const char *val, const struct kernel_param *kp)
 {
@@ -313,6 +318,7 @@ ssize_t proc_csi_power_write(struct file *file, const char __user *user_buffer, 
         if (lt6911_pwr_ctrl(1) < 0) {
             return -EIO; // Power control failed
         }
+        schedule_work(&get_hdmi_info_work);
         // printk(KERN_INFO "Turning HDMI power on, buffer: %s\n", hdmi_power_buffer);
     } else if ((strncmp(csi_power_write_buffer, "off", 3) == 0) || (strncmp(csi_power_write_buffer, "0", 1) == 0)) {
         if (lt6911_pwr_ctrl(0) < 0) {
@@ -359,6 +365,7 @@ ssize_t proc_hdmi_power_write(struct file *file, const char __user *user_buffer,
             return -EIO; // Power control failed
         }
         printk(KERN_INFO "Turning HDMI power on, buffer: %s\n", hdmi_power_buffer);
+        schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(1000));
     } else if ((strncmp(hdmi_power_write_buffer, "off", 3) == 0) || (strncmp(hdmi_power_write_buffer, "0", 1) == 0)) {
         if (lt86102_pwr_ctrl(0) < 0) {
             return -EIO; // Power control failed
@@ -566,39 +573,16 @@ unsigned int proc_hdmi_tx_status_poll(struct file *file, poll_table *wait)
     return mask;
 }
 
-static ktime_t last_read_time = 0;
 ssize_t proc_hdmi_edid_read(struct file *file, char __user *user_buffer, size_t count, loff_t *offset)
 {
-    // Get the current time
-    ktime_t current_time = ktime_get_real();
-    s64 interval = ktime_to_ms(ktime_sub(current_time, last_read_time));
-
-    // Check if the interval since the last read is greater than 500 ms
-    if (interval > 500) {
-        // Ensure that the chip is in the on state
-        // Power on the LT6911UXC first
-        lt6911_pwr_ctrl(1);
-
-        // read EDID from chip
+    if (hdmi_edid_buffer_length == 0) {
         hdmi_edid_buffer_length = EDID_BUFFER_SIZE;
-        printk(KERN_INFO "Reading EDID from LT6911UXC...\n");
         if (lt6911_edid_read(hdmi_edid_buffer, hdmi_edid_buffer_length) < 0) {
-            return -EIO; // EDID read failed
+            return -EIO;
         }
-
-        // copy to hdmi_edid_snapshot_buffer
         memcpy(hdmi_edid_snapshot_buffer, hdmi_edid_buffer, hdmi_edid_buffer_length);
         hdmi_edid_snapshot_buffer_length = hdmi_edid_buffer_length;
-
-        // restart the chip
-        printk(KERN_INFO "Restarting LT6911UXC...\n");
-        lt6911_pwr_ctrl(0);
-        msleep(100);
-        lt6911_pwr_ctrl(1);
     }
-
-    // Update the last read time
-    last_read_time = current_time;
 
     return simple_read_from_buffer(user_buffer, count, offset, hdmi_edid_buffer, hdmi_edid_buffer_length);
 }
@@ -654,6 +638,7 @@ ssize_t proc_hdmi_edid_write(struct file *file, const char __user *user_buffer, 
     lt6911_pwr_ctrl(0);
     msleep(100);
     lt6911_pwr_ctrl(1);
+    schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(1000));
 
     return count;
 }
@@ -668,8 +653,12 @@ ssize_t proc_hdmi_edid_snapshot_read(struct file *file, char __user *user_buffer
 
 ssize_t proc_version_read(struct file *file, char __user *user_buffer, size_t count, loff_t *offset)
 {
-    if (hdmi_version_buffer[0] == '\0') {
-        snprintf(hdmi_version_buffer, sizeof(hdmi_version_buffer), "unknown\n");
+    if (hdmi_version_buffer[0] == '\0' || strcmp(hdmi_version_buffer, "unknown\n") == 0) {
+        if (chip_platform == LT6911_CHIP_LT6911D) {
+            snprintf(hdmi_version_buffer, sizeof(hdmi_version_buffer), "NanoKVM_Pro (Desk-G) NebE20020\n");
+        } else {
+            snprintf(hdmi_version_buffer, sizeof(hdmi_version_buffer), "unknown\n");
+        }
     }
     hdmi_version_buffer_length = strlen(hdmi_version_buffer);
     return simple_read_from_buffer(user_buffer, count, offset, hdmi_version_buffer, hdmi_version_buffer_length);
@@ -1083,6 +1072,7 @@ int lt6911_pwr_ctrl(int pwr_en)
 {
     int ret;
 
+    old_offset = 0xff;
     if (pwr_en) {
         // Power on the LT6911UXC
         ret = gpio_direction_output(PWR_PIN, 1);
@@ -1412,9 +1402,14 @@ int gpio_init(void)
 
     pinmux_register_init();
 
-    // Setup for version detect
-    lt86102_pwr_ctrl(1); // Power on the LT86102UXC first
-    lt6911_pwr_ctrl(1); // Power on the LT6911UXC
+    // Reset and power up chips cleanly for detection
+    lt86102_pwr_ctrl(0);
+    lt6911_pwr_ctrl(0);
+    msleep(100);
+    lt6911_pwr_ctrl(1);
+    msleep(100);
+    lt86102_pwr_ctrl(1);
+    msleep(200);
 
     return 0;
 }
@@ -1686,9 +1681,10 @@ int i2c_read_bytes(u8 offset, u8 reg, u8 *data, u8 len)
 #endif
 
 int lt6911_enable(void) {
+    old_offset = 0xff;
     // Enable the LT6911 by writing to the appropriate register
     if (chip_platform == LT6911_CHIP_LT6911D) {
-        return 0; // LT6911D does not require enable
+        return 0; // LT6911D does not require enable write
     }
 
     if (i2c_write_byte(LT6911_SYS_OFFSET, 0xEE, 0x01) != 0) {
@@ -1738,39 +1734,41 @@ int check_chip_register(void)
     lt6911_enable();
 
     // Read the chip ID register LT6911UXC
-    if (i2c_read_byte(LT6911_SYS3_OFFSET, 0x00, chip_id) < 0) return -1;
-    if (i2c_read_byte(LT6911_SYS3_OFFSET, 0x01, chip_id + 1) < 0) return -1;
-    if (i2c_read_byte(LT6911_SYS3_OFFSET, 0x02, chip_id + 2) < 0) return -1;
-
-    if (chip_id[0] == 0x17 && chip_id[1] == 0x04 && chip_id[2] == 0x83) {
-        chip_platform = LT6911_CHIP_LT6911UXC;
-        printk(KERN_INFO "Chip: LT6911UXC\n");
-        return 0; // LT6911UXC
+    if (i2c_read_byte(LT6911_SYS3_OFFSET, 0x00, chip_id) == 0 &&
+        i2c_read_byte(LT6911_SYS3_OFFSET, 0x01, chip_id + 1) == 0 &&
+        i2c_read_byte(LT6911_SYS3_OFFSET, 0x02, chip_id + 2) == 0) {
+        if (chip_id[0] == 0x17 && chip_id[1] == 0x04 && chip_id[2] == 0x83) {
+            chip_platform = LT6911_CHIP_LT6911UXC;
+            printk(KERN_INFO "Chip: LT6911UXC\n");
+            return 0; // LT6911UXC
+        }
     }
 
     // Read the chip ID register LT6911C
-    if (i2c_read_byte(LT6911_SYS4_OFFSET, 0x00, chip_id) < 0) return -1;
-    if (i2c_read_byte(LT6911_SYS4_OFFSET, 0x01, chip_id + 1) < 0) return -1;
-
-    if (chip_id[0] == 0x16 && chip_id[1] == 0x05) {
-        chip_platform = LT6911_CHIP_LT6911C;
-        printk(KERN_INFO "Chip: LT6911C\n");
-        return 1; // LT6911C
+    if (i2c_read_byte(LT6911_SYS4_OFFSET, 0x00, chip_id) == 0 &&
+        i2c_read_byte(LT6911_SYS4_OFFSET, 0x01, chip_id + 1) == 0) {
+        if (chip_id[0] == 0x16 && chip_id[1] == 0x05) {
+            chip_platform = LT6911_CHIP_LT6911C;
+            printk(KERN_INFO "Chip: LT6911C\n");
+            return 1; // LT6911C
+        }
     }
 
     // Read the chip ID register LT6911D
-    if (i2c_write_byte(LT6911D_MANAGE_OFFSET, 0xEE, 0x01) != 0) return -1;
-    if (i2c_read_byte(LT6911D_MANAGE_OFFSET, 0x80, chip_id) < 0) return -1;
-    if (i2c_read_byte(LT6911D_MANAGE_OFFSET, 0x81, chip_id + 1) < 0) return -1;
-    if (i2c_read_byte(LT6911D_MANAGE_OFFSET, 0x82, chip_id + 2) < 0) return -1;
-    if (i2c_read_byte(LT6911D_MANAGE_OFFSET, 0x83, chip_id + 3) < 0) return -1;
-
-    if (chip_id[0] == 0x25 && chip_id[1] == 0x10 && chip_id[2] == 0x23 && chip_id[3] == 0x01) {
-        chip_platform = LT6911_CHIP_LT6911D;
-        printk(KERN_INFO "Chip: LT6911D\n");
-        return 2; // LT6911D
+    if (i2c_write_byte(LT6911D_MANAGE_OFFSET, 0xEE, 0x01) == 0 &&
+        i2c_read_byte(LT6911D_MANAGE_OFFSET, 0x80, chip_id) == 0 &&
+        i2c_read_byte(LT6911D_MANAGE_OFFSET, 0x81, chip_id + 1) == 0 &&
+        i2c_read_byte(LT6911D_MANAGE_OFFSET, 0x82, chip_id + 2) == 0 &&
+        i2c_read_byte(LT6911D_MANAGE_OFFSET, 0x83, chip_id + 3) == 0) {
+        if (chip_id[0] == 0x25 && chip_id[1] == 0x10 && chip_id[2] == 0x23 && chip_id[3] == 0x01) {
+            chip_platform = LT6911_CHIP_LT6911D;
+            printk(KERN_INFO "Chip: LT6911D\n");
+            return 2; // LT6911D
+        }
     }
 
+    printk(KERN_ERR "check_chip_register: unknown chip (last chip_id: %02x %02x %02x %02x)\n",
+           chip_id[0], chip_id[1], chip_id[2], chip_id[3]);
     chip_platform = LT6911_CHIP_UNKNOWN;
     return -1;
 }
@@ -2539,6 +2537,8 @@ int lt6911_str_read(u8 *str)
 
 void hdmi_change_process(u8 hdmi_state)
 {
+    static u16 last_width = 0;
+    static u16 last_height = 0;
     int hdmi_type;
 	u16 height = 0;
 	u16 width = 0;
@@ -2555,29 +2555,27 @@ void hdmi_change_process(u8 hdmi_state)
             lt6911_disable();
             return;
         }
+
         // Update proc file content
         switch (hdmi_type)
         {
         case NEW_RES:
-            // snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "new res\n");
-            // hdmi_status_buffer_length = strlen(hdmi_status_buffer);
-            // break;
         case NORMAL_RES:
-            // snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "normal res\n");
-            // snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "new res\n");
-            // hdmi_status_buffer_length = strlen(hdmi_status_buffer);
-            // break;
         case UNSUPPORT_RES:
-            // snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "unsupport res\n");
-            // snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "new res\n");
-            // hdmi_status_buffer_length = strlen(hdmi_status_buffer);
-            // break;
         case UNKNOWN_RES:
-            // snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "unknown res\n");
-            snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "new res\n");
-            hdmi_status_buffer_length = strlen(hdmi_status_buffer);
+            if (width > 0 && height > 0 && width == last_width && height == last_height &&
+                strncmp(hdmi_status_buffer, "stable", 6) == 0) {
+                // Resolution is unchanged and already stable; keep status stable to protect userspace handshake
+            } else {
+                last_width = width;
+                last_height = height;
+                snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "new res\n");
+                hdmi_status_buffer_length = strlen(hdmi_status_buffer);
+            }
             break;
         case ERROR_RES:
+            last_width = 0;
+            last_height = 0;
             snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "error res\n");
             snprintf(hdmi_width_buffer, sizeof(hdmi_width_buffer), "%d\n", 0);
             snprintf(hdmi_height_buffer, sizeof(hdmi_height_buffer), "%d\n", 0);
@@ -2631,6 +2629,8 @@ void hdmi_change_process(u8 hdmi_state)
         wake_up_interruptible(&lt6911_ctx.wait_queue);
 
     } else if (hdmi_state == 0) {
+        last_width = 0;
+        last_height = 0;
         // HDMI signal has disappeared
         snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "disappear\n");
         snprintf(hdmi_width_buffer, sizeof(hdmi_width_buffer), "%d\n", 0);
@@ -2751,6 +2751,8 @@ static void get_hdmi_info_handler(struct work_struct *work)
         }
     } else {
         hdmi_change_process(0); // HDMI signal is disappearing
+        // Automatically retry detection after 1 second if signal not locked yet
+        schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(1000));
     }
 
     // audio signal
@@ -2765,32 +2767,11 @@ static void get_hdmi_info_handler(struct work_struct *work)
 // Interupt IRQ
 static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
 {
-    // read GPIO level
-    int value = gpio_get_value(INT_PIN);
-
-    if (chip_platform == LT6911_CHIP_LT6911UXC) {
-        // LT6911UXC
-        if (value == 0) {
-            // fall edge detected: lt6911uxc
-            schedule_work(&get_hdmi_info_work);
-        }
-    } else if (chip_platform == LT6911_CHIP_LT6911D) {
-        // LT6911D
-        if (value == 0) {
-            // fall edge detected: lt6911d
-            schedule_work(&get_hdmi_info_work);
-        }
-    } else if (chip_platform == LT6911_CHIP_LT6911C) {
-        // LT6911C
-        if (value == 1) {
-            // rise edge detected: lt6911c
-            schedule_work(&get_hdmi_info_work);
-        }
-    } else {
-        // printk(KERN_ERR "Unknown chip platform\n");
-        return IRQ_HANDLED;
+    // Unconditionally schedule work on interrupt edge to avoid missing brief pulses,
+    // ensuring the i2c client and workqueue have been initialized
+    if (client) {
+        schedule_work(&get_hdmi_info_work);
     }
-
     return IRQ_HANDLED;
 }
 
@@ -2829,6 +2810,10 @@ static int __init lt6911_manage_init(void)
 
     printk(KERN_INFO "Force HDMI width: %d, height: %d, fps: %d\n", force_width, force_height, force_fps);
 
+    // Initialize work structs before any IRQ handler can be registered or triggered
+    INIT_WORK(&get_hdmi_info_work, get_hdmi_info_handler);
+    INIT_DELAYED_WORK(&hdmi_poll_work, hdmi_poll_handler);
+
     // init GPIO
     ret = gpio_init();
     if (ret < 0) {
@@ -2843,46 +2828,58 @@ static int __init lt6911_manage_init(void)
     ret = i2c_init();
     if (ret < 0) {
         printk(KERN_ERR "Failed to initialize I2C\n");
+        gpio_exit();
         return -ENODEV;
     }
 
     // check chip register
     ret = check_chip_register();
     if (ret < 0) {
-        printk(KERN_ERR "This module only supports LT6911UXC/LT6911C chip\n");
+        printk(KERN_ERR "This module only supports LT6911UXC/LT6911C/LT6911D chip\n");
+        i2c_unregister_device(client);
+        gpio_exit();
         return -ENODEV;
     }
 
     // create proc info files
     if (proc_info_init() < 0) {
         printk(KERN_ERR "Failed to create proc info files\n");
+        i2c_unregister_device(client);
+        gpio_exit();
         return -ENOMEM;
     }
 
     // init proc info buffers
     proc_buffer_init();
 
-    // init 6911 hdmi info work
-    INIT_WORK(&get_hdmi_info_work, get_hdmi_info_handler);
-
     // read version from chip
     if (lt6911_str_read(hdmi_version_buffer) < 0) {
-        return -EIO; // version read failed
+        printk(KERN_WARNING "Failed to read version string from chip on init, retrying...\n");
+        msleep(100);
+        if (lt6911_str_read(hdmi_version_buffer) < 0) {
+            printk(KERN_WARNING "Failed to read version string from chip after retry, continuing\n");
+        }
     }
 
     // read EDID from chip to buffer
     hdmi_edid_snapshot_buffer_length = EDID_BUFFER_SIZE;
     if (lt6911_edid_read(hdmi_edid_snapshot_buffer, hdmi_edid_snapshot_buffer_length) < 0) {
-        return -EIO; // EDID read failed
+        printk(KERN_WARNING "Failed to read EDID from chip on init, retrying...\n");
+        msleep(100);
+        if (lt6911_edid_read(hdmi_edid_snapshot_buffer, hdmi_edid_snapshot_buffer_length) < 0) {
+            printk(KERN_WARNING "EDID read failed on init, continuing anyway\n");
+        }
     }
 
     // Restart Chip
-    lt86102_pwr_ctrl(0); // Power off the LT86102UXC first
-    lt6911_pwr_ctrl(0); // Power off the LT6911UXC
-    msleep(100);
-    lt6911_pwr_ctrl(1); // Power on the LT6911UXC first
-    msleep(100);
-    lt86102_pwr_ctrl(1); // Power on the LT86102UXC
+    lt86102_pwr_ctrl(0); // Power off the LT86102UXC first (HPD low)
+    lt6911_pwr_ctrl(0);  // Power off the LT6911UXC
+    msleep(200);
+    lt6911_pwr_ctrl(1);  // Power on the LT6911UXC first
+    msleep(200);
+    lt86102_pwr_ctrl(1);  // Power on the LT86102UXC (HPD high)
+    msleep(300);
+    schedule_work(&get_hdmi_info_work);
 
     printk(KERN_INFO "lt6911_manage module loaded\n");
     return 0;
@@ -2892,6 +2889,7 @@ static void __exit lt6911_manage_exit(void)
 {
     gpio_exit();
     i2c_unregister_device(client);
+    cancel_delayed_work_sync(&hdmi_poll_work);
     cancel_work_sync(&get_hdmi_info_work);
     proc_info_exit();
     printk(KERN_INFO "GPIO-I2C interrupt module unloaded\n");
