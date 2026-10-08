@@ -40,6 +40,15 @@
 #define AX_WDT_CLK_32K                      32000
 #define AX_WDT_CLK_24M                      24000000
 #define PERI_SYS_BASE                       0x4870000
+#define COMM_SYS_GLB_BASE                   0x02340000
+#define COMM_ABORT_CFG_OFFSET               0xA8
+#define COMM_CHIP_RST_SW                    BIT(0)
+
+#define TOP_CHIPMODE_GLB_BASE               0x02390000
+#define TOP_CHIPMODE_BACKUP0_OFFSET         0x24
+#define TOP_BOOT_KERNEL_FAIL                BIT(7)
+#define TOP_BOOT_DOWNLOAD                   BIT(8)
+
 static bool nowayout = WATCHDOG_NOWAYOUT;
 module_param(nowayout, bool, 0);
 MODULE_PARM_DESC(nowayout, "Watchdog cannot be stopped once started "
@@ -48,6 +57,8 @@ MODULE_PARM_DESC(nowayout, "Watchdog cannot be stopped once started "
 struct ax_wdt {
 	void __iomem *regs;
 	void __iomem *common;
+	void __iomem *comm_sys;
+	void __iomem *chipmode;
 	int irq;
 	int suspend_status;
 	u32 timeout;
@@ -221,7 +232,24 @@ static int ax_wdt_restart(struct watchdog_device *wdd,
 			  unsigned long action, void *data)
 {
 	struct ax_wdt *ax_wdt = to_ax_wdt(wdd);
-	//change clk to 24M, when reboot
+	u32 val;
+
+	/* 1. Clear BOOT_KERNEL_FAIL and BOOT_DOWNLOAD in backup register so SPL doesn't abort */
+	if (ax_wdt->chipmode) {
+		val = readl(ax_wdt->chipmode + TOP_CHIPMODE_BACKUP0_OFFSET);
+		val &= ~(TOP_BOOT_KERNEL_FAIL | TOP_BOOT_DOWNLOAD);
+		writel(val, ax_wdt->chipmode + TOP_CHIPMODE_BACKUP0_OFFSET);
+	}
+
+	/* 2. Trigger hardware chip reset via COMM_ABORT_CFG (matching U-Boot chip_rst_sw) */
+	if (ax_wdt->comm_sys) {
+		val = readl(ax_wdt->comm_sys + COMM_ABORT_CFG_OFFSET);
+		val |= COMM_CHIP_RST_SW;
+		writel(val, ax_wdt->comm_sys + COMM_ABORT_CFG_OFFSET);
+		mdelay(200);
+	}
+
+	/* 3. Fallback: watchdog reset */
 	ax_wdt_clk_enable(ax_wdt, AX_WDT_CLK_24M);
 	ax_wdt_reset_set(ax_wdt, 0);
 	ax_wdt_set_timeout(wdd, 0);
@@ -364,6 +392,8 @@ static int ax_wdt_drv_probe(struct platform_device *pdev)
 		pr_err("err %ld\n", PTR_ERR(ax_wdt->common));
 		return PTR_ERR(ax_wdt->common);
 	}
+	ax_wdt->comm_sys = devm_ioremap(dev, COMM_SYS_GLB_BASE, 0x1000);
+	ax_wdt->chipmode = devm_ioremap(dev, TOP_CHIPMODE_GLB_BASE, 0x1000);
 	ax_wdt_enable(ax_wdt, 0);
 	ret = device_property_read_u32(dev, "clock-frequency", &ax_wdt->rate);
 	if (ret) {

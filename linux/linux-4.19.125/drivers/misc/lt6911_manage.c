@@ -2841,15 +2841,7 @@ static int __init lt6911_manage_init(void)
         return -ENODEV;
     }
 
-    // create proc info files
-    if (proc_info_init() < 0) {
-        printk(KERN_ERR "Failed to create proc info files\n");
-        i2c_unregister_device(client);
-        gpio_exit();
-        return -ENOMEM;
-    }
-
-    // init proc info buffers
+    // init proc info buffers in memory
     proc_buffer_init();
 
     // read version from chip
@@ -2880,6 +2872,16 @@ static int __init lt6911_manage_init(void)
     lt86102_pwr_ctrl(1);  // Power on the LT86102UXC (HPD high)
     msleep(300);
     schedule_work(&get_hdmi_info_work);
+
+    // create proc info files only after hardware and buffers are fully initialized
+    if (proc_info_init() < 0) {
+        printk(KERN_ERR "Failed to create proc info files\n");
+        cancel_delayed_work_sync(&hdmi_poll_work);
+        cancel_work_sync(&get_hdmi_info_work);
+        i2c_unregister_device(client);
+        gpio_exit();
+        return -ENOMEM;
+    }
 
     printk(KERN_INFO "lt6911_manage module loaded\n");
     return 0;
