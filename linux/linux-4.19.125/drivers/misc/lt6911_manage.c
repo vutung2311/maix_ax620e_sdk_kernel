@@ -57,6 +57,8 @@
 static int force_width = -1;
 static int force_height = -1;
 static int force_fps = -1;
+static u16 last_width = 0;
+static u16 last_height = 0;
 
 void lt6911_force_resolution(u16 width, u16 height, int fps);
 static struct work_struct get_hdmi_info_work;
@@ -318,12 +320,15 @@ ssize_t proc_csi_power_write(struct file *file, const char __user *user_buffer, 
         if (lt6911_pwr_ctrl(1) < 0) {
             return -EIO; // Power control failed
         }
-        schedule_work(&get_hdmi_info_work);
+        // Allow LT6911 MCU 200ms to exit power-on reset before querying state
+        schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(200));
         // printk(KERN_INFO "Turning HDMI power on, buffer: %s\n", hdmi_power_buffer);
     } else if ((strncmp(csi_power_write_buffer, "off", 3) == 0) || (strncmp(csi_power_write_buffer, "0", 1) == 0)) {
         if (lt6911_pwr_ctrl(0) < 0) {
             return -EIO; // Power control failed
         }
+        last_width = 0;
+        last_height = 0;
         // update hdmi_status_buffer
         snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "disappear\n");
         hdmi_status_buffer_length = strlen(hdmi_status_buffer);
@@ -370,6 +375,8 @@ ssize_t proc_hdmi_power_write(struct file *file, const char __user *user_buffer,
         if (lt86102_pwr_ctrl(0) < 0) {
             return -EIO; // Power control failed
         }
+        last_width = 0;
+        last_height = 0;
         printk(KERN_INFO "Turning HDMI power off, buffer: %s\n", hdmi_power_buffer);
     } else {
         // printk(KERN_INFO "Turning HDMI power error\n");
@@ -2537,13 +2544,12 @@ int lt6911_str_read(u8 *str)
 
 void hdmi_change_process(u8 hdmi_state)
 {
-    static u16 last_width = 0;
-    static u16 last_height = 0;
     int hdmi_type;
 	u16 height = 0;
 	u16 width = 0;
     u16 fps = 0;
     u8 hdcp_mode;
+    bool res_changed = false;
 
     if (hdmi_state == 1) {
         // HDMI signal is stable
@@ -2563,14 +2569,14 @@ void hdmi_change_process(u8 hdmi_state)
         case NORMAL_RES:
         case UNSUPPORT_RES:
         case UNKNOWN_RES:
-            if (width > 0 && height > 0 && width == last_width && height == last_height &&
-                strncmp(hdmi_status_buffer, "stable", 6) == 0) {
-                // Resolution is unchanged and already stable; keep status stable to protect userspace handshake
+            if (width > 0 && height > 0 && width == last_width && height == last_height) {
+                // Resolution is unchanged; protect userspace handshake against interrupt storms
             } else {
                 last_width = width;
                 last_height = height;
                 snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "new res\n");
                 hdmi_status_buffer_length = strlen(hdmi_status_buffer);
+                res_changed = true;
             }
             break;
         case ERROR_RES:
@@ -2583,6 +2589,8 @@ void hdmi_change_process(u8 hdmi_state)
             hdmi_width_buffer_length = strlen(hdmi_width_buffer);
             hdmi_height_buffer_length = strlen(hdmi_height_buffer);
             printk(KERN_ERR "Error resolution detected\n");
+            atomic_inc(&lt6911_ctx.status);
+            wake_up_interruptible(&lt6911_ctx.wait_queue);
             lt6911_disable();
             return;
         default:
@@ -2625,8 +2633,10 @@ void hdmi_change_process(u8 hdmi_state)
         hdmi_fps_buffer_length = strlen(hdmi_fps_buffer);
         printk(KERN_INFO "HDMI FPS: %d\n", fps);
 
-        atomic_inc(&lt6911_ctx.status);
-        wake_up_interruptible(&lt6911_ctx.wait_queue);
+        if (res_changed) {
+            atomic_inc(&lt6911_ctx.status);
+            wake_up_interruptible(&lt6911_ctx.wait_queue);
+        }
 
     } else if (hdmi_state == 0) {
         last_width = 0;
