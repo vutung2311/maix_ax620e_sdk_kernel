@@ -59,12 +59,18 @@ static int force_height = -1;
 static int force_fps = -1;
 static u16 last_width = 0;
 static u16 last_height = 0;
+static bool lt6911_powered = true;
+static unsigned long lt6911_power_on_jiffies = 0;
+#define LT6911_POR_SETTLE_MS 250
+static DEFINE_MUTEX(lt6911_i2c_mutex);
 
 void lt6911_force_resolution(u16 width, u16 height, int fps);
 static struct work_struct get_hdmi_info_work;
 static struct delayed_work hdmi_poll_work;
 static void hdmi_poll_handler(struct work_struct *work)
 {
+    if (!lt6911_powered)
+        return;
     schedule_work(&get_hdmi_info_work);
 }
 
@@ -320,10 +326,11 @@ ssize_t proc_csi_power_write(struct file *file, const char __user *user_buffer, 
         if (lt6911_pwr_ctrl(1) < 0) {
             return -EIO; // Power control failed
         }
-        // Allow LT6911 MCU 200ms to exit power-on reset before querying state
-        schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(200));
+        // Allow LT6911 MCU 250ms to exit power-on reset before querying state
+        schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(LT6911_POR_SETTLE_MS));
         // printk(KERN_INFO "Turning HDMI power on, buffer: %s\n", hdmi_power_buffer);
     } else if ((strncmp(csi_power_write_buffer, "off", 3) == 0) || (strncmp(csi_power_write_buffer, "0", 1) == 0)) {
+        cancel_delayed_work_sync(&hdmi_poll_work);
         if (lt6911_pwr_ctrl(0) < 0) {
             return -EIO; // Power control failed
         }
@@ -372,6 +379,7 @@ ssize_t proc_hdmi_power_write(struct file *file, const char __user *user_buffer,
         printk(KERN_INFO "Turning HDMI power on, buffer: %s\n", hdmi_power_buffer);
         schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(1000));
     } else if ((strncmp(hdmi_power_write_buffer, "off", 3) == 0) || (strncmp(hdmi_power_write_buffer, "0", 1) == 0)) {
+        cancel_delayed_work_sync(&hdmi_poll_work);
         if (lt86102_pwr_ctrl(0) < 0) {
             return -EIO; // Power control failed
         }
@@ -1081,6 +1089,8 @@ int lt6911_pwr_ctrl(int pwr_en)
 
     old_offset = 0xff;
     if (pwr_en) {
+        lt6911_power_on_jiffies = jiffies;
+        lt6911_powered = true;
         // Power on the LT6911UXC
         ret = gpio_direction_output(PWR_PIN, 1);
         if (ret < 0) {
@@ -1091,6 +1101,7 @@ int lt6911_pwr_ctrl(int pwr_en)
         snprintf(csi_power_buffer, sizeof(csi_power_buffer), "on\n");
         csi_power_buffer_length = strlen(csi_power_buffer);
     } else {
+        lt6911_powered = false;
         // Power off the LT6911UXC
         ret = gpio_direction_output(PWR_PIN, 0);
         if (ret < 0) {
@@ -1526,24 +1537,45 @@ void board_version_check(void)
 // I2C write function
 int i2c_write_byte(u8 offset, u8 reg, u8 data)
 {
-    int ret;
+    int ret = 0;
+    int retry;
 
-    // if offset is changed, write it first
-    if (offset != old_offset) {
-        ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
+    if (!lt6911_powered)
+        return -ENODEV;
+
+    mutex_lock(&lt6911_i2c_mutex);
+    for (retry = 0; retry < 3; retry++) {
+        // if offset is changed, write it first
+        if (offset != old_offset) {
+            ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
+            if (ret < 0) {
+                old_offset = 0xff;
+                if (retry < 2) {
+                    msleep(5);
+                    continue;
+                }
+                printk(KERN_ERR "[W]Failed to write offset to the i2c bus; ret = %d\n", ret);
+                mutex_unlock(&lt6911_i2c_mutex);
+                return -1;
+            }
+            old_offset = offset;
+        }
+
+        // write the data to the i2c bus
+        ret = i2c_smbus_write_byte_data(client, reg, data);
         if (ret < 0) {
-            printk(KERN_ERR "[W]Failed to write offset to the i2c bus; ret = %d\n", ret);
+            old_offset = 0xff;
+            if (retry < 2) {
+                msleep(5);
+                continue;
+            }
+            printk(KERN_ERR "[W]Failed to write data to the i2c bus; ret = %d\n", ret);
+            mutex_unlock(&lt6911_i2c_mutex);
             return -1;
         }
-        old_offset = offset;
+        break;
     }
-
-    // write the data to the i2c bus
-    ret = i2c_smbus_write_byte_data(client, reg, data);
-    if (ret < 0) {
-        printk(KERN_ERR "[W]Failed to write data to the i2c bus; ret = %d\n", ret);
-        return -1;
-    }
+    mutex_unlock(&lt6911_i2c_mutex);
 
     return 0;
 }
@@ -1551,26 +1583,47 @@ int i2c_write_byte(u8 offset, u8 reg, u8 data)
 // I2C read function
 int i2c_read_byte(u8 offset, u8 reg, u8 *data)
 {
-    int ret;
+    int ret = 0;
+    int retry;
 
-    // if offset is changed, write it first
-    if (offset != old_offset) {
-        ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
+    if (!lt6911_powered)
+        return -ENODEV;
+
+    mutex_lock(&lt6911_i2c_mutex);
+    for (retry = 0; retry < 3; retry++) {
+        // if offset is changed, write it first
+        if (offset != old_offset) {
+            ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
+            if (ret < 0) {
+                old_offset = 0xff;
+                if (retry < 2) {
+                    msleep(5);
+                    continue;
+                }
+                printk(KERN_ERR "[W]Failed to write offset to the i2c bus; ret = %d\n", ret);
+                mutex_unlock(&lt6911_i2c_mutex);
+                return -1;
+            }
+            old_offset = offset;
+        }
+
+        ret = i2c_smbus_read_byte_data(client, reg);
         if (ret < 0) {
-            printk(KERN_ERR "[W]Failed to write offset to the i2c bus; ret = %d\n", ret);
+            old_offset = 0xff;
+            if (retry < 2) {
+                msleep(5);
+                continue;
+            }
+            printk(KERN_ERR "[R]Failed to read data from the i2c bus; ret = %d\n", ret);
+            mutex_unlock(&lt6911_i2c_mutex);
             return -1;
         }
-        old_offset = offset;
-    }
 
-    ret = i2c_smbus_read_byte_data(client, reg);
-    if (ret < 0) {
-        printk(KERN_ERR "[R]Failed to read data from the i2c bus; ret = %d\n", ret);
-        return -1;
+        // ret >= 0
+        *data = (u8)ret;
+        break;
     }
-
-    // ret > 0
-    *data = (u8)ret;
+    mutex_unlock(&lt6911_i2c_mutex);
 
     return 0;
 }
@@ -1580,15 +1633,20 @@ int i2c_read_byte(u8 offset, u8 reg, u8 *data)
 // I2C write function
 int i2c_write_bytes(u8 offset, u8 reg, u8 *data, u16 len)
 {
-    u8 buf[2] = {0};
     int ret;
     u16 count;
 
+    if (!lt6911_powered)
+        return -ENODEV;
+
+    mutex_lock(&lt6911_i2c_mutex);
     // if offset is changed, write it first
     if (offset != old_offset) {
         ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
         if (ret < 0) {
+            old_offset = 0xff;
             printk(KERN_ERR "[W]Failed to write offset to the i2c bus; ret = %d\n", ret);
+            mutex_unlock(&lt6911_i2c_mutex);
             return -1;
         }
         old_offset = offset;
@@ -1598,10 +1656,13 @@ int i2c_write_bytes(u8 offset, u8 reg, u8 *data, u16 len)
     for (count = 0; count < len; count ++){
         ret = i2c_smbus_write_byte_data(client, reg, *(data+count));
         if (ret < 0) {
+            old_offset = 0xff;
             printk(KERN_ERR "[W]Failed to write data to the i2c bus; ret = %d\n", ret);
+            mutex_unlock(&lt6911_i2c_mutex);
             return -1;
         }
     }
+    mutex_unlock(&lt6911_i2c_mutex);
 
     return 0;
 }
@@ -1612,11 +1673,17 @@ int i2c_read_bytes(u8 offset, u8 reg, u8 *data, u16 len)
     int ret;
     u16 count;
 
+    if (!lt6911_powered)
+        return -ENODEV;
+
+    mutex_lock(&lt6911_i2c_mutex);
     // if offset is changed, write it first
     if (offset != old_offset) {
         ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
         if (ret < 0) {
+            old_offset = 0xff;
             printk(KERN_ERR "[W]Failed to write offset to the i2c bus; ret = %d\n", ret);
+            mutex_unlock(&lt6911_i2c_mutex);
             return -1;
         }
         old_offset = offset;
@@ -1626,11 +1693,14 @@ int i2c_read_bytes(u8 offset, u8 reg, u8 *data, u16 len)
     for (count = 0; count < len; count ++) {
         ret = i2c_smbus_read_byte_data(client, reg);
         if (ret < 0) {
+            old_offset = 0xff;
             printk(KERN_ERR "[R]Failed to read data from the i2c bus; ret = %d\n", ret);
+            mutex_unlock(&lt6911_i2c_mutex);
             return -1;
         }   // ret > 0
         *(data+count) = (u8)ret;
     }
+    mutex_unlock(&lt6911_i2c_mutex);
 
     return 0;
 }
@@ -1641,11 +1711,17 @@ int i2c_write_bytes(u8 offset, u8 reg, u8 *data, u8 len)
 {
     int ret;
 
+    if (!lt6911_powered)
+        return -ENODEV;
+
+    mutex_lock(&lt6911_i2c_mutex);
     // if offset is changed, write it first
     if (offset != old_offset) {
         ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
         if (ret < 0) {
+            old_offset = 0xff;
             printk(KERN_ERR "[W]Failed to write offset to the i2c bus; ret = %d\n", ret);
+            mutex_unlock(&lt6911_i2c_mutex);
             return -1;
         }
         old_offset = offset;
@@ -1654,9 +1730,12 @@ int i2c_write_bytes(u8 offset, u8 reg, u8 *data, u8 len)
     // write the data to the i2c bus
     ret = i2c_smbus_write_i2c_block_data(client, reg, len, data);
     if (ret < 0) {
+        old_offset = 0xff;
         printk(KERN_ERR "[W]Failed to write data to the i2c bus; ret = %d\n", ret);
+        mutex_unlock(&lt6911_i2c_mutex);
         return -1;
     }
+    mutex_unlock(&lt6911_i2c_mutex);
 
     return 0;
 }
@@ -1666,11 +1745,17 @@ int i2c_read_bytes(u8 offset, u8 reg, u8 *data, u8 len)
 {
     int ret;
 
+    if (!lt6911_powered)
+        return -ENODEV;
+
+    mutex_lock(&lt6911_i2c_mutex);
     // if offset is changed, write it first
     if (offset != old_offset) {
         ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
         if (ret < 0) {
+            old_offset = 0xff;
             printk(KERN_ERR "[W]Failed to write offset to the i2c bus; ret = %d\n", ret);
+            mutex_unlock(&lt6911_i2c_mutex);
             return -1;
         }
         old_offset = offset;
@@ -1678,10 +1763,12 @@ int i2c_read_bytes(u8 offset, u8 reg, u8 *data, u8 len)
 
     ret = i2c_smbus_read_i2c_block_data(client, reg, len, data);
     if (ret < 0) {
+        old_offset = 0xff;
         printk(KERN_ERR "[R]Failed to read data from the i2c bus; ret = %d\n", ret);
+        mutex_unlock(&lt6911_i2c_mutex);
         return -1;
     }
-
+    mutex_unlock(&lt6911_i2c_mutex);
 
     return 0;
 }
@@ -2734,8 +2821,18 @@ void audio_change_process(u8 audio_state)
 
 static void get_hdmi_info_handler(struct work_struct *work)
 {
-    u8 signal_state;
+    u8 signal_state = 0;
     int ret;
+
+    if (!lt6911_powered)
+        return;
+
+    // Defer probing if chip is still within the power-on settling window (250ms)
+    if (time_before(jiffies, lt6911_power_on_jiffies + msecs_to_jiffies(LT6911_POR_SETTLE_MS))) {
+        unsigned long remaining = (lt6911_power_on_jiffies + msecs_to_jiffies(LT6911_POR_SETTLE_MS)) - jiffies;
+        schedule_delayed_work(&hdmi_poll_work, remaining);
+        return;
+    }
 
     if (lt6911_enable() < 0) return;
     if (lt6911_disable_watchdog() < 0) {
@@ -2746,12 +2843,12 @@ static void get_hdmi_info_handler(struct work_struct *work)
 
     // check HDMI state
     ret = lt6911_get_signal_state(&signal_state);
-    printk(KERN_INFO "HDMI signal state: 0x%02x\n", signal_state);
     if (ret < 0) {
         printk(KERN_ERR "Failed to get HDMI state\n");
         lt6911_disable();
         return;
     }
+    printk(KERN_INFO "HDMI signal state: 0x%02x\n", signal_state);
 
     if (signal_state & 0x01) {
         if (force_height != -1 && force_width != -1) {
@@ -2762,7 +2859,9 @@ static void get_hdmi_info_handler(struct work_struct *work)
     } else {
         hdmi_change_process(0); // HDMI signal is disappearing
         // Automatically retry detection after 1 second if signal not locked yet
-        schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(1000));
+        if (lt6911_powered) {
+            schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(1000));
+        }
     }
 
     // audio signal
@@ -2777,11 +2876,17 @@ static void get_hdmi_info_handler(struct work_struct *work)
 // Interupt IRQ
 static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
 {
-    // Unconditionally schedule work on interrupt edge to avoid missing brief pulses,
-    // ensuring the i2c client and workqueue have been initialized
-    if (client) {
-        schedule_work(&get_hdmi_info_work);
+    if (!client || !lt6911_powered)
+        return IRQ_HANDLED;
+
+    // Defer probing if chip is still within the power-on settling window (250ms)
+    if (time_before(jiffies, lt6911_power_on_jiffies + msecs_to_jiffies(LT6911_POR_SETTLE_MS))) {
+        unsigned long remaining = (lt6911_power_on_jiffies + msecs_to_jiffies(LT6911_POR_SETTLE_MS)) - jiffies;
+        schedule_delayed_work(&hdmi_poll_work, remaining);
+        return IRQ_HANDLED;
     }
+
+    schedule_work(&get_hdmi_info_work);
     return IRQ_HANDLED;
 }
 
