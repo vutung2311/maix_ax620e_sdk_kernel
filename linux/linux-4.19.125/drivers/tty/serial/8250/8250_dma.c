@@ -60,7 +60,10 @@ static void __dma_rx_complete(void *param)
 	if (dma_status == DMA_IN_PROGRESS)
 		return;
 
-	count = dma->rx_size - state.residue;
+	if (state.residue > dma->rx_size)
+		count = 0;
+	else
+		count = dma->rx_size - state.residue;
 
 	tty_insert_flip_string(tty_port, dma->rx_buf, count);
 	p->port.icount.rx += count;
