@@ -1,7 +1,7 @@
 #include "hyn_core.h"
 #define HYN_DRIVER_NAME  "hyn_ts"
 
-static struct hyn_ts_data *hyn_data = NULL;
+struct hyn_ts_data *hyn_data = NULL;
 static const struct hyn_ts_fuc* hyn_fun = NULL;
 static const struct of_device_id hyn_of_match_table[] = {
     {.compatible = "hyn,66xx", .data = &cst66xx_fuc,},   /*suport 36xx 35xx 66xx 68xx 148E*/
@@ -52,7 +52,7 @@ static int hyn_parse_dt(struct hyn_ts_data *ts_data)
             }
         }
         else{
-            HYN_INFO("vdd_ana not config");
+            HYN_INFO2("vdd_ana not config");
         }
 
 //iovcc supply
@@ -64,7 +64,7 @@ static int hyn_parse_dt(struct hyn_ts_data *ts_data)
             }
         }
         else{
-            HYN_INFO("vdd_i2c not config");
+            HYN_INFO2("vdd_i2c not config");
         }
 
 //gpio info
@@ -122,7 +122,7 @@ static int hyn_parse_dt(struct hyn_ts_data *ts_data)
             }
         }
         else{
-            HYN_INFO("key not config");
+            HYN_INFO2("key not config");
             dt->key_num = 0;
         }
         return 0;
@@ -587,9 +587,9 @@ static int fb_notifier_callback(struct notifier_block *self, unsigned long event
 
     blank_value = *((int *)blank_data);
 
-    HYN_INFO("notifier,event:%lu,blank:%d", event, blank_value);
+    HYN_INFO2("notifier,event:%lu,blank:%d", event, blank_value);
     if (hyn_data->old_fb_state == blank_value) {
-        HYN_INFO("don't care");
+        HYN_INFO2("don't care");
         return 0;
     }
 
@@ -774,7 +774,7 @@ static int hyn_ts_probe(struct spi_device *client)
     hyn_irq_set(ts_data , DISABLE);
 
 #if defined(CONFIG_FB)
-    HYN_INFO("fb_notif_register");
+    HYN_INFO2("fb_notif_register");
     ts_data->fb_notif.notifier_call = fb_notifier_callback;
     ret = fb_register_client(&ts_data->fb_notif);
     if (ret) {

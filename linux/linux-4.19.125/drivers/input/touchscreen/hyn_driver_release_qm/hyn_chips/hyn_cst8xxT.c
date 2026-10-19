@@ -303,7 +303,13 @@ static int cst8xxT_updata_judge(u8 *p_fw, u16 len)
     f_fw_project_id = (p_data[1]<<24) + (p_data[2]<<16) + (p_data[3]<<8) + (p_data[4]<<0);
     f_fw_ver = p_data[5];
 
-    HYN_INFO("Bin_info fw_project_id:%04x ictype:%04x fw_ver:%x checksum:%#x",f_fw_project_id,f_ictype,f_fw_ver,f_checksum);
+    HYN_INFO2("Bin_info fw_project_id:%04x ictype:%04x fw_ver:%x checksum:%#x",f_fw_project_id,f_ictype,f_fw_ver,f_checksum);
+
+    if (f_ictype != ic->fw_chip_type || f_fw_project_id != ic->fw_project_id) {
+        HYN_INFO2("fw bin mismatch (chip:0x%02x vs 0x%02x, project:0x%x vs 0x%x), skip update",
+                  f_ictype, ic->fw_chip_type, f_fw_project_id, ic->fw_project_id);
+        return 0; //not updata
+    }
 
     if(f_checksum != ic->ic_fw_checksum && f_fw_ver >= ic->fw_ver){
         return 1; //need updata

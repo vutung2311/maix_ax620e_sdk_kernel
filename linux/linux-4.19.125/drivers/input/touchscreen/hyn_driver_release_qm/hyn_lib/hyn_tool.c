@@ -278,7 +278,10 @@ int hyn_tool_fs_int(struct hyn_ts_data *ts_data)
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 1, 0))
     ret = misc_register(&hyn_tool_dev);
 	misc_state = ret;
-	HYN_INFO("hyn_tool_dev register %s",ret ? "failed":"sucess");
+	if (ret)
+		HYN_ERROR("hyn_tool_dev register failed: %d", ret);
+	else
+		HYN_INFO2("hyn_tool_dev register success");
 #endif
 	g_tool_dir = proc_mkdir(HYN_PROC_DIR_NAME, NULL);	
 	if (IS_ERR_OR_NULL(g_tool_dir)){
@@ -301,7 +304,7 @@ int hyn_tool_fs_int(struct hyn_ts_data *ts_data)
 		remove_proc_entry(HYN_PROC_DIR_NAME, NULL);
 		return -ENOMEM;
 	}
-	HYN_INFO("apk node creat success");
+	HYN_INFO2("apk node creat success");
 	return 0;
 }
 

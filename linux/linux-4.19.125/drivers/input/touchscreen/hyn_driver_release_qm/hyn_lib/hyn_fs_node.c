@@ -316,7 +316,7 @@ int hyn_create_sysfs(struct hyn_ts_data *ts_data)
 	// 	kobject_put(ts_data->sys_node);
 	// 	return -1;
 	// }
-	HYN_INFO("sys_node creat success ,GKI version is [%s]",HYN_GKI_VER ? "enable":"disable");
+	HYN_INFO2("sys_node creat success ,GKI version is [%s]",HYN_GKI_VER ? "enable":"disable");
 	return ret;
 }
 

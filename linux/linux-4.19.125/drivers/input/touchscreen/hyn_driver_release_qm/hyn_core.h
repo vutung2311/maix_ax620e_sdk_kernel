@@ -71,12 +71,15 @@
 
 // #define __noscs             __attribute__((__no_sanitize__("shadow-call-stack")))
 
+struct hyn_ts_data;
+extern struct hyn_ts_data *hyn_data;
+
 #define HYN_INFO(fmt, args...)   printk(KERN_INFO "[HYN]"fmt"\n", ##args)
-#define HYN_INFO2(fmt, args...)  if(hyn_data->log_level > 0)printk(KERN_INFO "[HYN]"fmt"\n", ##args)
-#define HYN_INFO3(fmt, args...)  if(hyn_data->log_level > 1)printk(KERN_INFO "[HYN]"fmt"\n", ##args)
-#define HYN_INFO4(fmt, args...)  if(hyn_data->log_level > 2)printk(KERN_INFO "[HYN]"fmt"\n", ##args)
+#define HYN_INFO2(fmt, args...)  do { if(hyn_data && hyn_data->log_level > 0) printk(KERN_INFO "[HYN]"fmt"\n", ##args); } while (0)
+#define HYN_INFO3(fmt, args...)  do { if(hyn_data && hyn_data->log_level > 1) printk(KERN_INFO "[HYN]"fmt"\n", ##args); } while (0)
+#define HYN_INFO4(fmt, args...)  do { if(hyn_data && hyn_data->log_level > 2) printk(KERN_INFO "[HYN]"fmt"\n", ##args); } while (0)
 #define HYN_ERROR(fmt, args...)  printk(KERN_ERR "[HYN][Error]%s:"fmt"\n",__func__,##args)
-#define HYN_ENTER()              printk(KERN_ERR "[HYN][enter]%s\n",__func__)
+#define HYN_ENTER()              do {} while (0)
 
 #if HYN_GKI_VER
     // MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
