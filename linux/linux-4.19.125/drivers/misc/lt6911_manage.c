@@ -70,7 +70,11 @@ static u16 last_fps = LT6911_MODE_UNKNOWN;
 static u16 last_hdcp = LT6911_MODE_UNKNOWN;
 static bool lt6911_powered = true;
 static unsigned long lt6911_power_on_jiffies = 0;
+/* Set on unload (and a failed load) so no path re-arms the work being cancelled. */
+static bool lt6911_stopping;
 #define LT6911_POR_SETTLE_MS 250
+/* Largest /proc EDID write accepted: 256 bytes of EDID + 32 of name. */
+#define LT6911_EDID_WRITE_MAX (EDID_BUFFER_SIZE + LT6911UXC_WR_SIZE)
 /*
  * Locking. lt6911_i2c_mutex (inner) guards one register access together with
  * old_offset and lt6911_powered. lt6911_xfer_mutex (outer) is held across a
@@ -112,7 +116,7 @@ static struct work_struct get_hdmi_info_work;
 static struct delayed_work hdmi_poll_work;
 static void hdmi_poll_handler(struct work_struct *work)
 {
-    if (!lt6911_powered)
+    if (!lt6911_powered || READ_ONCE(lt6911_stopping))
         return;
     schedule_work(&get_hdmi_info_work);
 }
@@ -125,7 +129,9 @@ static int force_res_param_set(const char *val, const struct kernel_param *kp)
         return ret;
 
     if (old_val != -1 && *(int *)kp->arg == -1) {
-        schedule_work(&get_hdmi_info_work);
+        // The param file outlives module_exit until sysfs teardown.
+        if (!READ_ONCE(lt6911_stopping))
+            schedule_work(&get_hdmi_info_work);
         return 0;
     }
 
@@ -612,10 +618,18 @@ ssize_t proc_hdmi_tx_status_read(struct file *file, char __user *user_buffer, si
 
 ssize_t proc_hdmi_tx_status_write(struct file *file, const char __user *user_buffer, size_t count, loff_t *offset)
 {
+    char buf[8];
+
+    if (count == 0 || count > sizeof(buf) - 1)
+        return -EINVAL;
+    if (copy_from_user(buf, user_buffer, count))
+        return -EFAULT;
+    buf[count] = '\0';
+
     // check input is "0"/"off" or "1"/"on" then ctrl HDMI TXO_PIN
-    if (strncmp(user_buffer, "0", 1) == 0 || strncmp(user_buffer, "off", 3) == 0) {
+    if (strncmp(buf, "0", 1) == 0 || strncmp(buf, "off", 3) == 0) {
         set_hdmi_loopout(0);
-    } else if (strncmp(user_buffer, "1", 1) == 0 || strncmp(user_buffer, "on", 2) == 0) {
+    } else if (strncmp(buf, "1", 1) == 0 || strncmp(buf, "on", 2) == 0) {
         set_hdmi_loopout(1);
     } else {
         return -EINVAL;
@@ -666,8 +680,13 @@ ssize_t proc_hdmi_edid_write(struct file *file, const char __user *user_buffer, 
 {
     // copy to edid_write_buffer
     int i;
-    u8 edid_write_buffer[count]; // 256 bytes for EDID or +32 bytes for EDID name
-    u8 edid_read_buffer[count]; // 256 bytes for EDID or +32 bytes for EDID name
+    // Bounded: 256 bytes of EDID, plus up to 32 of name. check_edid() then
+    // insists on exactly EDID_BUFFER_SIZE.
+    u8 edid_write_buffer[LT6911_EDID_WRITE_MAX];
+    u8 edid_read_buffer[LT6911_EDID_WRITE_MAX];
+
+    if (count == 0 || count > sizeof(edid_write_buffer))
+        return -EINVAL;
     if (copy_from_user(edid_write_buffer, user_buffer, count)) {
         return -EFAULT;
     }
@@ -751,11 +770,16 @@ ssize_t proc_version_read(struct file *file, char __user *user_buffer, size_t co
 
 ssize_t proc_version_write(struct file *file, const char __user *user_buffer, size_t count, loff_t *offset)
 {
-    // copy to version_write_buffer
-    u8 version_write_buffer[count]; // 256 bytes for EDID or +32 bytes for EDID name
+    // copy to version_write_buffer; the chip stores at most
+    // LT6911UXC_WR_SIZE bytes, the extra byte keeps the printk terminated.
+    u8 version_write_buffer[LT6911UXC_WR_SIZE + 1];
+
+    if (count == 0 || count > LT6911UXC_WR_SIZE)
+        return -EINVAL;
     if (copy_from_user(version_write_buffer, user_buffer, count)) {
         return -EFAULT;
     }
+    version_write_buffer[count] = '\0';
 
     // print buffer by hex
     printk(KERN_INFO "Writing version: ");
@@ -962,6 +986,11 @@ void proc_buffer_init(void)
     audio_sample_rate_buffer_length = strlen(audio_sample_rate_buffer);
 }
 
+/*
+ * Writable entries are 0644: every writer (NanoKVM-Server, kvm_vin/kvm_ui
+ * via kvmcomm.sh, kvm_sleep.py, reset_to_default.sh) runs as root, and an
+ * unprivileged write could power the capture chip off or rewrite its EDID.
+ */
 int proc_info_init(void)
 {
     // create proc dir
@@ -977,25 +1006,25 @@ int proc_info_init(void)
     }
 
     // create proc pwr ctrl files
-    proc_csi_power_file = proc_create(PROC_CSI_PWR, 0666, proc_lt6911_dir, &proc_csi_power_fops);    // W&R
+    proc_csi_power_file = proc_create(PROC_CSI_PWR, 0644, proc_lt6911_dir, &proc_csi_power_fops);    // W&R
     if (!proc_csi_power_file) {
         goto err;
     }
 
     // create proc hdmi pwr ctrl files
-    proc_hdmi_power_file = proc_create(PROC_HDMI_PWR, 0666, proc_lt6911_dir, &proc_hdmi_power_fops);    // W&R
+    proc_hdmi_power_file = proc_create(PROC_HDMI_PWR, 0644, proc_lt6911_dir, &proc_hdmi_power_fops);    // W&R
     if (!proc_hdmi_power_file) {
         goto err;
     }
 
     // create proc hdmi loopout pwr ctrl files
-    proc_loopout_power_file = proc_create(PROC_LOOPOUT_PWR, 0666, proc_lt6911_dir, &proc_loopout_power_fops);    // W&R
+    proc_loopout_power_file = proc_create(PROC_LOOPOUT_PWR, 0644, proc_lt6911_dir, &proc_loopout_power_fops);    // W&R
     if (!proc_loopout_power_file) {
         goto err;
     }
 
     // create proc hdmi info files
-    proc_hdmi_status_file = proc_create(PROC_HDMI_STATUS, 0666, proc_lt6911_dir, &proc_hdmi_status_fops); // W&R
+    proc_hdmi_status_file = proc_create(PROC_HDMI_STATUS, 0644, proc_lt6911_dir, &proc_hdmi_status_fops); // W&R
     if (!proc_hdmi_status_file) {
         goto err;
     }
@@ -1040,13 +1069,13 @@ int proc_info_init(void)
     /*
     Temporarily retain the write function to maintain compatibility with legacy applications.
     */
-    proc_hdmi_tx_status_file = proc_create(PROC_HDMI_TX_STATUS, 0666, proc_lt6911_dir, &proc_hdmi_tx_status_fops); // W&R
+    proc_hdmi_tx_status_file = proc_create(PROC_HDMI_TX_STATUS, 0644, proc_lt6911_dir, &proc_hdmi_tx_status_fops); // W&R
     if (!proc_hdmi_tx_status_file) {
         goto err;
     }
 
     // create proc hdmi edid file
-    proc_hdmi_edid_file = proc_create(PROC_HDMI_EDID, 0666, proc_lt6911_dir, &proc_hdmi_edid_fops); // W&R
+    proc_hdmi_edid_file = proc_create(PROC_HDMI_EDID, 0644, proc_lt6911_dir, &proc_hdmi_edid_fops); // W&R
     if (!proc_hdmi_edid_file) {
         goto err;
     }
@@ -1058,7 +1087,7 @@ int proc_info_init(void)
     }
 
     // create proc version file
-    proc_version_file = proc_create(PROC_VERSION, 0666, proc_lt6911_dir, &proc_version_fops); // W&R
+    proc_version_file = proc_create(PROC_VERSION, 0644, proc_lt6911_dir, &proc_version_fops); // W&R
     if (!proc_version_file) {
         goto err;
     }
@@ -1349,6 +1378,54 @@ void pinmux_register_init(void)
     }
 }
 
+/*
+ * GPIOs this module actually holds, so every error path and the exit path
+ * free exactly those and nothing twice.
+ */
+#define LT6911_GPIO_INT  BIT(0)
+#define LT6911_GPIO_PWR  BIT(1)
+#define LT6911_GPIO_HDMI BIT(2)
+#define LT6911_GPIO_RXI  BIT(3)
+#define LT6911_GPIO_TXI  BIT(4)
+#define LT6911_GPIO_TXO  BIT(5)
+#define LT6911_GPIO_LOOP BIT(6)
+static unsigned int lt6911_gpio_owned;
+static bool lt6911_int_irq_requested;
+
+static void gpio_free_irqs(void);
+static void gpio_free_pins(void);
+
+/*
+ * Cancel all work for good. The info work and the poll work re-arm each
+ * other, so set the stop flag first, then cancel info, poll, and info once
+ * more: a run that started before the flag may re-arm the other one once,
+ * and a run that starts after it sees the flag and re-arms nothing.
+ */
+static void lt6911_stop_work(void)
+{
+    WRITE_ONCE(lt6911_stopping, true);
+    cancel_work_sync(&get_hdmi_info_work);
+    cancel_delayed_work_sync(&hdmi_poll_work);
+    cancel_work_sync(&get_hdmi_info_work);
+    cancel_delayed_work_sync(&irq_ctx.work);
+}
+
+/* Request @pin and record it; a pin the board does not have (< 0) is skipped. */
+static int lt6911_gpio_take(int pin, unsigned int bit, const char *label)
+{
+    int ret;
+
+    if (pin < 0)
+        return 0;
+    ret = gpio_request(pin, label);
+    if (ret) {
+        printk(KERN_ERR "Failed to request GPIO %d (%s)\n", pin, label);
+        return ret;
+    }
+    lt6911_gpio_owned |= bit;
+    return 0;
+}
+
 int gpio_init(void)
 {
     int ret;
@@ -1384,55 +1461,51 @@ int gpio_init(void)
         return -1;
     }
 
-    if (gpio_request(INT_PIN, "init_gpio") < 0) {
-        printk(KERN_ERR "GPIO request failed\n");
-        return -1;
-    }
+    ret = lt6911_gpio_take(INT_PIN, LT6911_GPIO_INT, "init_gpio");
+    if (ret)
+        return ret;
 
     if ((irq_number = gpio_to_irq(INT_PIN)) < 0) {
         printk(KERN_ERR "Unable to get IRQ number\n");
-        gpio_free(INT_PIN);
-        return -1;
+        ret = -1;
+        goto err;
     }
 
+    /*
+     * Both edges on purpose: the chip pulses INT on a mode change and the
+     * line's level says nothing about which way. schedule_work() already
+     * coalesces edges that arrive while the work is pending, and
+     * hdmi_change_process() suppresses a repeat of the same mode, so a
+     * second edge costs one chip read, not a userspace event. Do not add
+     * a level filter here; one dropped resolution changes silently.
+     */
     ret = request_irq(irq_number, gpio_irq_handler,
                      Int_Action, "init_gpio_irq", NULL);
     if (ret) {
         printk(KERN_ERR "Unable to request IRQ\n");
-        gpio_free(INT_PIN);
-        return ret;
+        goto err;
     }
+    lt6911_int_irq_requested = true;
 
     // Initialize GPIO for LT6911UXC PWR pin
-    ret = gpio_request(PWR_PIN, "LT6911UXC_PWR");
-    if (ret) {
-        printk(KERN_ERR "Failed to request GPIO %d for LT6911UXC PWR pin\n", PWR_PIN);
-        gpio_free(INT_PIN);
-        return ret;
-    }
+    ret = lt6911_gpio_take(PWR_PIN, LT6911_GPIO_PWR, "LT6911UXC_PWR");
+    if (ret)
+        goto err;
 
-    if (HDMI_PIN >= 0) {
-        // Initialize GPIO for LT86102UXC HDMI pin
-        ret = gpio_request(HDMI_PIN, "LT86102UXC_HDMI_PWR");
-        if (ret) {
-            printk(KERN_ERR "Failed to request GPIO %d for LT86102UXC HDMI pin\n", HDMI_PIN);
-            gpio_free(PWR_PIN);
-            gpio_free(INT_PIN);
-            return ret;
-        }
-    }
+    // Initialize GPIO for LT86102UXC HDMI pin
+    ret = lt6911_gpio_take(HDMI_PIN, LT6911_GPIO_HDMI, "LT86102UXC_HDMI_PWR");
+    if (ret)
+        goto err;
 
     update_interface_status_buffer();
     if (HDMI_RXI_PIN >= 0) {
-        // Initialize GPIO for HDMI RX Interface pin
-        ret = gpio_request(HDMI_RXI_PIN, "LT86102UXC_HDMI_RXI");
+        // Initialize GPIO for HDMI RX Interface pin. As before, only a
+        // failure to make it an input is fatal; a failed request is logged.
+        lt6911_gpio_take(HDMI_RXI_PIN, LT6911_GPIO_RXI, "LT86102UXC_HDMI_RXI");
         ret = gpio_direction_input(HDMI_RXI_PIN);
         if (ret) {
-            printk(KERN_ERR "Failed to request GPIO %d for HDMI RX Interface pin\n", HDMI_RXI_PIN);
-            gpio_free(PWR_PIN);
-            gpio_free(INT_PIN);
-            gpio_free(HDMI_PIN);
-            return ret;
+            printk(KERN_ERR "Failed to set GPIO %d for HDMI RX Interface pin as input\n", HDMI_RXI_PIN);
+            goto err;
         }
 
         irq_ctx.rxi_irq = gpio_to_irq(HDMI_RXI_PIN);
@@ -1448,16 +1521,12 @@ int gpio_init(void)
     }
 
     if (HDMI_TXI_PIN >= 0) {
-        // Initialize GPIO for HDMI TX Interface pin
-        ret = gpio_request(HDMI_TXI_PIN, "LT86102UXC_HDMI_TXI");
+        // Initialize GPIO for HDMI TX Interface pin (same rule as RXI)
+        lt6911_gpio_take(HDMI_TXI_PIN, LT6911_GPIO_TXI, "LT86102UXC_HDMI_TXI");
         ret = gpio_direction_input(HDMI_TXI_PIN);
         if (ret) {
-            printk(KERN_ERR "Failed to request GPIO %d for HDMI TX Interface pin\n", HDMI_TXI_PIN);
-            gpio_free(PWR_PIN);
-            gpio_free(INT_PIN);
-            gpio_free(HDMI_PIN);
-            gpio_free(HDMI_RXI_PIN);
-            return ret;
+            printk(KERN_ERR "Failed to set GPIO %d for HDMI TX Interface pin as input\n", HDMI_TXI_PIN);
+            goto err;
         }
 
         irq_ctx.txi_irq = gpio_to_irq(HDMI_TXI_PIN);
@@ -1472,34 +1541,15 @@ int gpio_init(void)
         }
     }
 
-    if (HDMI_TXO_PIN >= 0) {
-        // Initialize GPIO for HDMI TX Control pin
-        ret = gpio_request(HDMI_TXO_PIN, "LT86102UXC_HDMI_TXO");
-        if (ret) {
-            printk(KERN_ERR "Failed to request GPIO %d for HDMI TX Control pin\n", HDMI_TXO_PIN);
-            gpio_free(PWR_PIN);
-            gpio_free(INT_PIN);
-            gpio_free(HDMI_PIN);
-            gpio_free(HDMI_RXI_PIN);
-            gpio_free(HDMI_TXI_PIN);
-            return ret;
-        }
-    }
+    // Initialize GPIO for HDMI TX Control pin
+    ret = lt6911_gpio_take(HDMI_TXO_PIN, LT6911_GPIO_TXO, "LT86102UXC_HDMI_TXO");
+    if (ret)
+        goto err;
 
-    if (LOOP_CTRL_PIN >= 0) {
-        // Initialize GPIO for HDMI LOOP CTRL pin
-        ret = gpio_request(LOOP_CTRL_PIN, "LT86102UXC_LOOP_CTRL");
-        if (ret) {
-            printk(KERN_ERR "Failed to request GPIO %d for HDMI LOOP CTRL pin\n", LOOP_CTRL_PIN);
-            gpio_free(PWR_PIN);
-            gpio_free(INT_PIN);
-            gpio_free(HDMI_PIN);
-            gpio_free(HDMI_RXI_PIN);
-            gpio_free(HDMI_TXI_PIN);
-            gpio_free(HDMI_TXO_PIN);
-            return ret;
-        }
-    }
+    // Initialize GPIO for HDMI LOOP CTRL pin
+    ret = lt6911_gpio_take(LOOP_CTRL_PIN, LT6911_GPIO_LOOP, "LT86102UXC_LOOP_CTRL");
+    if (ret)
+        goto err;
 
     // Apply the requested loop-out state once both control pins are ours
     // (default on, as before; kvmcomm passes loopout=0 when passthrough is off).
@@ -1518,28 +1568,43 @@ int gpio_init(void)
     msleep(200);
 
     return 0;
+
+err:
+    // Nothing is powered yet; drop whatever was taken, IRQs first.
+    gpio_free_irqs();
+    lt6911_stop_work();
+    gpio_free_pins();
+    return ret;
 }
 
-int gpio_exit(void)
+/* Free every IRQ this module requested. After this no handler can queue work. */
+static void gpio_free_irqs(void)
 {
-    // Free the IRQ and GPIO resources
-    free_irq(irq_number, NULL);
-    if (irq_ctx.rxi_irq >= 0)
+    if (lt6911_int_irq_requested) {
+        free_irq(irq_number, NULL);
+        lt6911_int_irq_requested = false;
+    }
+    if (irq_ctx.rxi_irq >= 0) {
         free_irq(irq_ctx.rxi_irq, NULL);
-    if (irq_ctx.txi_irq >= 0)
+        irq_ctx.rxi_irq = -1;
+    }
+    if (irq_ctx.txi_irq >= 0) {
         free_irq(irq_ctx.txi_irq, NULL);
+        irq_ctx.txi_irq = -1;
+    }
+}
 
-    cancel_delayed_work_sync(&irq_ctx.work);
-
-    gpio_free(INT_PIN);
-    gpio_free(PWR_PIN);
-    if (HDMI_PIN >= 0) gpio_free(HDMI_PIN);
-    if (HDMI_RXI_PIN >= 0) gpio_free(HDMI_RXI_PIN);
-    if (HDMI_TXI_PIN >= 0) gpio_free(HDMI_TXI_PIN);
-    if (HDMI_TXO_PIN >= 0) gpio_free(HDMI_TXO_PIN);
-    if (LOOP_CTRL_PIN >= 0) gpio_free(LOOP_CTRL_PIN);
-
-    return 0;
+/* Free every GPIO this module requested. */
+static void gpio_free_pins(void)
+{
+    if (lt6911_gpio_owned & LT6911_GPIO_INT) gpio_free(INT_PIN);
+    if (lt6911_gpio_owned & LT6911_GPIO_PWR) gpio_free(PWR_PIN);
+    if (lt6911_gpio_owned & LT6911_GPIO_HDMI) gpio_free(HDMI_PIN);
+    if (lt6911_gpio_owned & LT6911_GPIO_RXI) gpio_free(HDMI_RXI_PIN);
+    if (lt6911_gpio_owned & LT6911_GPIO_TXI) gpio_free(HDMI_TXI_PIN);
+    if (lt6911_gpio_owned & LT6911_GPIO_TXO) gpio_free(HDMI_TXO_PIN);
+    if (lt6911_gpio_owned & LT6911_GPIO_LOOP) gpio_free(LOOP_CTRL_PIN);
+    lt6911_gpio_owned = 0;
 }
 
 /* return 0 : normal res;
@@ -2940,7 +3005,7 @@ static void get_hdmi_info_handler(struct work_struct *work)
     u8 signal_state = 0;
     int ret;
 
-    if (!lt6911_powered)
+    if (!lt6911_powered || READ_ONCE(lt6911_stopping))
         return;
 
     // Defer probing if chip is still within the power-on settling window (250ms)
@@ -2990,7 +3055,7 @@ static void get_hdmi_info_handler(struct work_struct *work)
             hdmi_change_process(0); // HDMI signal is disappearing
         }
         // Retry in case the lock interrupt is missed, backing off while dark.
-        if (lt6911_powered) {
+        if (lt6911_powered && !READ_ONCE(lt6911_stopping)) {
             schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(delay));
             WRITE_ONCE(nosig_poll_ms, min_t(unsigned int, delay * 2, LT6911_NOSIG_POLL_MAX_MS));
         }
@@ -3030,8 +3095,6 @@ int i2c_init(void)
     adapter = i2c_get_adapter(I2C_BUS);
     if (!adapter) {
         printk(KERN_ERR "Failed to get I2C adapter\n");
-        free_irq(irq_number, NULL);
-        gpio_free(INT_PIN);
         return -1;
     }
     // printk(KERN_INFO "I2C adapter %d obtained\n", I2C_BUS);
@@ -3040,8 +3103,7 @@ int i2c_init(void)
     client = i2c_new_dummy(adapter, LT6911_ADDR);
     if (!client) {
         printk(KERN_ERR "Failed to create I2C device\n");
-        free_irq(irq_number, NULL);
-        gpio_free(INT_PIN);
+        i2c_put_adapter(adapter);
         return -1;
     }
 
@@ -3049,6 +3111,34 @@ int i2c_init(void)
     i2c_put_adapter(adapter);
 
     return 0;
+}
+
+/*
+ * Undo a successful gpio_init() and i2c_init(), in dependency order:
+ * proc entries (no new /proc writer) -> IRQs (no new edge) -> work, cancelled
+ * synchronously (lt6911_stop_work) -> power down -> GPIOs -> I2C client.
+ * remove_proc_entry() waits for writers already inside a handler.
+ */
+static void lt6911_teardown(bool proc_created)
+{
+    if (proc_created)
+        proc_info_exit();
+
+    gpio_free_irqs();
+    lt6911_stop_work();
+
+    if (HDMI_PIN >= 0)
+        lt86102_pwr_ctrl(0);
+    mutex_lock(&lt6911_xfer_mutex);
+    lt6911_pwr_ctrl(0);
+    mutex_unlock(&lt6911_xfer_mutex);
+
+    gpio_free_pins();
+
+    if (client) {
+        i2c_unregister_device(client);
+        client = NULL;
+    }
 }
 
 static int __init lt6911_manage_init(void)
@@ -3076,7 +3166,7 @@ static int __init lt6911_manage_init(void)
     ret = i2c_init();
     if (ret < 0) {
         printk(KERN_ERR "Failed to initialize I2C\n");
-        gpio_exit();
+        lt6911_teardown(false);
         return -ENODEV;
     }
 
@@ -3089,8 +3179,7 @@ static int __init lt6911_manage_init(void)
     if (ret < 0) {
         mutex_unlock(&lt6911_xfer_mutex);
         printk(KERN_ERR "This module only supports LT6911UXC/LT6911C/LT6911D chip\n");
-        i2c_unregister_device(client);
-        gpio_exit();
+        lt6911_teardown(false);
         return -ENODEV;
     }
 
@@ -3130,10 +3219,8 @@ static int __init lt6911_manage_init(void)
     // create proc info files only after hardware and buffers are fully initialized
     if (proc_info_init() < 0) {
         printk(KERN_ERR "Failed to create proc info files\n");
-        cancel_delayed_work_sync(&hdmi_poll_work);
-        cancel_work_sync(&get_hdmi_info_work);
-        i2c_unregister_device(client);
-        gpio_exit();
+        // proc_info_init() already removed what it had created.
+        lt6911_teardown(false);
         return -ENOMEM;
     }
 
@@ -3143,11 +3230,7 @@ static int __init lt6911_manage_init(void)
 
 static void __exit lt6911_manage_exit(void)
 {
-    gpio_exit();
-    i2c_unregister_device(client);
-    cancel_delayed_work_sync(&hdmi_poll_work);
-    cancel_work_sync(&get_hdmi_info_work);
-    proc_info_exit();
+    lt6911_teardown(true);
     printk(KERN_INFO "GPIO-I2C interrupt module unloaded\n");
 }
 
@@ -3155,7 +3238,7 @@ module_init(lt6911_manage_init);
 module_exit(lt6911_manage_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.0.34");
+MODULE_VERSION("0.0.35");
 MODULE_AUTHOR("Z2Z-BuGu");
 MODULE_AUTHOR("916BGAI");
 MODULE_DESCRIPTION("NanoKVM-Pro HDMI Module Management");

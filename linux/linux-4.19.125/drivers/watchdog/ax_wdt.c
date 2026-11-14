@@ -394,6 +394,14 @@ static int ax_wdt_drv_probe(struct platform_device *pdev)
 	}
 	ax_wdt->comm_sys = devm_ioremap(dev, COMM_SYS_GLB_BASE, 0x1000);
 	ax_wdt->chipmode = devm_ioremap(dev, TOP_CHIPMODE_GLB_BASE, 0x1000);
+	/*
+	 * Both are optional: restart skips the step whose mapping failed and
+	 * falls back to the watchdog timeout, so warn instead of failing probe.
+	 */
+	if (!ax_wdt->comm_sys)
+		dev_warn(dev, "COMM_SYS_GLB map failed, restart will not use the chip reset\n");
+	if (!ax_wdt->chipmode)
+		dev_warn(dev, "TOP_CHIPMODE map failed, restart will not clear the boot-fail flags\n");
 	ax_wdt_enable(ax_wdt, 0);
 	ret = device_property_read_u32(dev, "clock-frequency", &ax_wdt->rate);
 	if (ret) {
