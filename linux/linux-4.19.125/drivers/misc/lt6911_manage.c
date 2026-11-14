@@ -57,12 +57,38 @@
 static int force_width = -1;
 static int force_height = -1;
 static int force_fps = -1;
+/*
+ * Last mode reported to userspace. A same-mode interrupt is debounced, but a
+ * change of any field (a 60 -> 30 Hz switch keeps W x H) is reported.
+ * last_fps / last_hdcp hold LT6911_MODE_UNKNOWN when not yet read.
+ */
+#define LT6911_MODE_UNKNOWN 0xffff
+#define LT6911_FPS_TOLERANCE 2
 static u16 last_width = 0;
 static u16 last_height = 0;
+static u16 last_fps = LT6911_MODE_UNKNOWN;
+static u16 last_hdcp = LT6911_MODE_UNKNOWN;
 static bool lt6911_powered = true;
 static unsigned long lt6911_power_on_jiffies = 0;
 #define LT6911_POR_SETTLE_MS 250
+/*
+ * Locking. lt6911_i2c_mutex (inner) guards one register access together with
+ * old_offset and lt6911_powered. lt6911_xfer_mutex (outer) is held across a
+ * whole chip transaction (enable ... disable, an EDID or version read/write,
+ * a power change from /proc) so a power-off cannot land in the middle of one.
+ * Order: lt6911_xfer_mutex, then lt6911_i2c_mutex. Never take the outer one
+ * while holding the inner one.
+ */
+static DEFINE_MUTEX(lt6911_xfer_mutex);
 static DEFINE_MUTEX(lt6911_i2c_mutex);
+
+static void lt6911_reset_last_mode(void)
+{
+    last_width = 0;
+    last_height = 0;
+    last_fps = LT6911_MODE_UNKNOWN;
+    last_hdcp = LT6911_MODE_UNKNOWN;
+}
 
 /*
  * No-signal fallback poll. The INT line reports signal lock; the poll only
@@ -326,6 +352,7 @@ ssize_t proc_csi_power_read(struct file *file, char __user *user_buffer, size_t 
 
 ssize_t proc_csi_power_write(struct file *file, const char __user *user_buffer, size_t count, loff_t *offset)
 {
+    int ret;
 
     if (count > sizeof(csi_power_write_buffer) - 1) {
         return -EINVAL; // Buffer overflow
@@ -340,7 +367,10 @@ ssize_t proc_csi_power_write(struct file *file, const char __user *user_buffer, 
 
     // check if "on" or "off"
     if ((strncmp(csi_power_write_buffer, "on", 2) == 0) || (strncmp(csi_power_write_buffer, "1", 1) == 0)) {
-        if (lt6911_pwr_ctrl(1) < 0) {
+        mutex_lock(&lt6911_xfer_mutex);
+        ret = lt6911_pwr_ctrl(1);
+        mutex_unlock(&lt6911_xfer_mutex);
+        if (ret < 0) {
             return -EIO; // Power control failed
         }
         // Allow LT6911 MCU 250ms to exit power-on reset before querying state
@@ -348,11 +378,15 @@ ssize_t proc_csi_power_write(struct file *file, const char __user *user_buffer, 
         // printk(KERN_INFO "Turning HDMI power on, buffer: %s\n", hdmi_power_buffer);
     } else if ((strncmp(csi_power_write_buffer, "off", 3) == 0) || (strncmp(csi_power_write_buffer, "0", 1) == 0)) {
         cancel_delayed_work_sync(&hdmi_poll_work);
-        if (lt6911_pwr_ctrl(0) < 0) {
+        // Wait for any transaction in flight, then cut power between two.
+        mutex_lock(&lt6911_xfer_mutex);
+        ret = lt6911_pwr_ctrl(0);
+        if (ret == 0)
+            lt6911_reset_last_mode();
+        mutex_unlock(&lt6911_xfer_mutex);
+        if (ret < 0) {
             return -EIO; // Power control failed
         }
-        last_width = 0;
-        last_height = 0;
         // update hdmi_status_buffer
         snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "disappear\n");
         hdmi_status_buffer_length = strlen(hdmi_status_buffer);
@@ -400,8 +434,9 @@ ssize_t proc_hdmi_power_write(struct file *file, const char __user *user_buffer,
         if (lt86102_pwr_ctrl(0) < 0) {
             return -EIO; // Power control failed
         }
-        last_width = 0;
-        last_height = 0;
+        mutex_lock(&lt6911_xfer_mutex);
+        lt6911_reset_last_mode();
+        mutex_unlock(&lt6911_xfer_mutex);
         printk(KERN_INFO "Turning HDMI power off, buffer: %s\n", hdmi_power_buffer);
     } else {
         // printk(KERN_INFO "Turning HDMI power error\n");
@@ -607,16 +642,24 @@ unsigned int proc_hdmi_tx_status_poll(struct file *file, poll_table *wait)
 
 ssize_t proc_hdmi_edid_read(struct file *file, char __user *user_buffer, size_t count, loff_t *offset)
 {
+    ssize_t ret;
+
+    mutex_lock(&lt6911_xfer_mutex);
     if (hdmi_edid_buffer_length == 0) {
-        hdmi_edid_buffer_length = EDID_BUFFER_SIZE;
-        if (lt6911_edid_read(hdmi_edid_buffer, hdmi_edid_buffer_length) < 0) {
+        // Mark the cache valid only once the chip has actually returned it,
+        // so a failed read is retried instead of served later as EDID.
+        if (lt6911_edid_read(hdmi_edid_buffer, EDID_BUFFER_SIZE) < 0) {
+            mutex_unlock(&lt6911_xfer_mutex);
             return -EIO;
         }
+        hdmi_edid_buffer_length = EDID_BUFFER_SIZE;
         memcpy(hdmi_edid_snapshot_buffer, hdmi_edid_buffer, hdmi_edid_buffer_length);
         hdmi_edid_snapshot_buffer_length = hdmi_edid_buffer_length;
     }
 
-    return simple_read_from_buffer(user_buffer, count, offset, hdmi_edid_buffer, hdmi_edid_buffer_length);
+    ret = simple_read_from_buffer(user_buffer, count, offset, hdmi_edid_buffer, hdmi_edid_buffer_length);
+    mutex_unlock(&lt6911_xfer_mutex);
+    return ret;
 }
 
 ssize_t proc_hdmi_edid_write(struct file *file, const char __user *user_buffer, size_t count, loff_t *offset)
@@ -641,17 +684,25 @@ ssize_t proc_hdmi_edid_write(struct file *file, const char __user *user_buffer, 
         return -EINVAL; // Invalid EDID data
     }
 
+    mutex_lock(&lt6911_xfer_mutex);
+
+    // The chip's EDID is about to change (even a failed write may have
+    // erased it), so the next /proc read must fetch it again.
+    hdmi_edid_buffer_length = 0;
+
     // Ensure that the chip is in the on state
     // Power on the LT6911UXC first
     lt6911_pwr_ctrl(1);
 
     // write EDID to chip
     if (lt6911_edid_write(edid_write_buffer, count) < 0) {
+        mutex_unlock(&lt6911_xfer_mutex);
         return -EIO; // EDID write failed
     }
 
     // read EDID from chip
     if (lt6911_edid_read(edid_read_buffer, count) < 0) {
+        mutex_unlock(&lt6911_xfer_mutex);
         return -EIO; // EDID read failed
     }
 
@@ -661,6 +712,7 @@ ssize_t proc_hdmi_edid_write(struct file *file, const char __user *user_buffer, 
 
     // check if read EDID is same as write EDID
     if (memcmp(edid_write_buffer, edid_read_buffer, count) != 0) {
+        mutex_unlock(&lt6911_xfer_mutex);
         printk(KERN_ERR "EDID write verification failed\n");
         return -EIO; // EDID write verification failed
     }
@@ -670,6 +722,7 @@ ssize_t proc_hdmi_edid_write(struct file *file, const char __user *user_buffer, 
     lt6911_pwr_ctrl(0);
     msleep(100);
     lt6911_pwr_ctrl(1);
+    mutex_unlock(&lt6911_xfer_mutex);
     schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(1000));
 
     return count;
@@ -708,22 +761,27 @@ ssize_t proc_version_write(struct file *file, const char __user *user_buffer, si
     printk(KERN_INFO "Writing version: ");
     printk(KERN_CONT "%s\n", version_write_buffer);
 
+    mutex_lock(&lt6911_xfer_mutex);
+
     // Ensure that the chip is in the on state
     // Power on the LT6911UXC first
     lt6911_pwr_ctrl(1);
 
     // write version to chip
     if (lt6911_str_write(version_write_buffer, count) < 0) {
+        mutex_unlock(&lt6911_xfer_mutex);
         return -EIO; // version write failed
     }
 
     // read version from chip
     if (lt6911_str_read(hdmi_version_buffer) < 0) {
+        mutex_unlock(&lt6911_xfer_mutex);
         return -EIO; // version read failed
     }
 
     // check if read version is same as write version
     if (memcmp(version_write_buffer, hdmi_version_buffer, count) != 0) {
+        mutex_unlock(&lt6911_xfer_mutex);
         printk(KERN_ERR "version write verification failed\n");
         return -EIO; // version write verification failed
     }
@@ -733,6 +791,7 @@ ssize_t proc_version_write(struct file *file, const char __user *user_buffer, si
     lt6911_pwr_ctrl(0);
     msleep(100);
     lt6911_pwr_ctrl(1);
+    mutex_unlock(&lt6911_xfer_mutex);
 
     return count;
 }
@@ -1100,10 +1159,15 @@ static irqreturn_t interface_irq_handler(int irq, void *dev_id)
     return IRQ_HANDLED;
 }
 
+/*
+ * Callers that can race a chip transaction (the /proc writers) hold
+ * lt6911_xfer_mutex around this; the I2C state itself is guarded here.
+ */
 int lt6911_pwr_ctrl(int pwr_en)
 {
     int ret;
 
+    mutex_lock(&lt6911_i2c_mutex);
     old_offset = 0xff;
     if (pwr_en) {
         lt6911_power_on_jiffies = jiffies;
@@ -1112,6 +1176,7 @@ int lt6911_pwr_ctrl(int pwr_en)
         lt6911_powered = true;
         // Power on the LT6911UXC
         ret = gpio_direction_output(PWR_PIN, 1);
+        mutex_unlock(&lt6911_i2c_mutex);
         if (ret < 0) {
             printk(KERN_ERR "Failed to set GPIO %d to high\n", PWR_PIN);
             return -1;
@@ -1123,6 +1188,7 @@ int lt6911_pwr_ctrl(int pwr_en)
         lt6911_powered = false;
         // Power off the LT6911UXC
         ret = gpio_direction_output(PWR_PIN, 0);
+        mutex_unlock(&lt6911_i2c_mutex);
         if (ret < 0) {
             printk(KERN_ERR "Failed to set GPIO %d to low\n", PWR_PIN);
             return -1;
@@ -1562,10 +1628,11 @@ int i2c_write_byte(u8 offset, u8 reg, u8 data)
     int ret = 0;
     int retry;
 
-    if (!lt6911_powered)
-        return -ENODEV;
-
     mutex_lock(&lt6911_i2c_mutex);
+    if (!lt6911_powered) {
+        mutex_unlock(&lt6911_i2c_mutex);
+        return -ENODEV;
+    }
     for (retry = 0; retry < 3; retry++) {
         // if offset is changed, write it first
         if (offset != old_offset) {
@@ -1608,10 +1675,11 @@ int i2c_read_byte(u8 offset, u8 reg, u8 *data)
     int ret = 0;
     int retry;
 
-    if (!lt6911_powered)
-        return -ENODEV;
-
     mutex_lock(&lt6911_i2c_mutex);
+    if (!lt6911_powered) {
+        mutex_unlock(&lt6911_i2c_mutex);
+        return -ENODEV;
+    }
     for (retry = 0; retry < 3; retry++) {
         // if offset is changed, write it first
         if (offset != old_offset) {
@@ -1658,10 +1726,11 @@ int i2c_write_bytes(u8 offset, u8 reg, u8 *data, u16 len)
     int ret;
     u16 count;
 
-    if (!lt6911_powered)
-        return -ENODEV;
-
     mutex_lock(&lt6911_i2c_mutex);
+    if (!lt6911_powered) {
+        mutex_unlock(&lt6911_i2c_mutex);
+        return -ENODEV;
+    }
     // if offset is changed, write it first
     if (offset != old_offset) {
         ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
@@ -1695,10 +1764,11 @@ int i2c_read_bytes(u8 offset, u8 reg, u8 *data, u16 len)
     int ret;
     u16 count;
 
-    if (!lt6911_powered)
-        return -ENODEV;
-
     mutex_lock(&lt6911_i2c_mutex);
+    if (!lt6911_powered) {
+        mutex_unlock(&lt6911_i2c_mutex);
+        return -ENODEV;
+    }
     // if offset is changed, write it first
     if (offset != old_offset) {
         ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
@@ -1733,10 +1803,11 @@ int i2c_write_bytes(u8 offset, u8 reg, u8 *data, u8 len)
 {
     int ret;
 
-    if (!lt6911_powered)
-        return -ENODEV;
-
     mutex_lock(&lt6911_i2c_mutex);
+    if (!lt6911_powered) {
+        mutex_unlock(&lt6911_i2c_mutex);
+        return -ENODEV;
+    }
     // if offset is changed, write it first
     if (offset != old_offset) {
         ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
@@ -1767,10 +1838,11 @@ int i2c_read_bytes(u8 offset, u8 reg, u8 *data, u8 len)
 {
     int ret;
 
-    if (!lt6911_powered)
-        return -ENODEV;
-
     mutex_lock(&lt6911_i2c_mutex);
+    if (!lt6911_powered) {
+        mutex_unlock(&lt6911_i2c_mutex);
+        return -ENODEV;
+    }
     // if offset is changed, write it first
     if (offset != old_offset) {
         ret = i2c_smbus_write_byte_data(client, LT6911_REG_OFFSET, offset);
@@ -1797,7 +1869,9 @@ int i2c_read_bytes(u8 offset, u8 reg, u8 *data, u8 len)
 #endif
 
 int lt6911_enable(void) {
+    mutex_lock(&lt6911_i2c_mutex);
     old_offset = 0xff;
+    mutex_unlock(&lt6911_i2c_mutex);
     // Enable the LT6911 by writing to the appropriate register
     if (chip_platform == LT6911_CHIP_LT6911D) {
         return 0; // LT6911D does not require enable write
@@ -2657,7 +2731,8 @@ void hdmi_change_process(u8 hdmi_state)
 	u16 height = 0;
 	u16 width = 0;
     u16 fps = 0;
-    u8 hdcp_mode;
+    u8 hdcp_mode = 0xff;
+    bool hdcp_known, fps_known;
     bool res_changed = false;
 
     if (hdmi_state == 1) {
@@ -2678,19 +2753,11 @@ void hdmi_change_process(u8 hdmi_state)
         case NORMAL_RES:
         case UNSUPPORT_RES:
         case UNKNOWN_RES:
-            if (width > 0 && height > 0 && width == last_width && height == last_height) {
-                // Resolution is unchanged; protect userspace handshake against interrupt storms
-            } else {
-                last_width = width;
-                last_height = height;
-                snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "new res\n");
-                hdmi_status_buffer_length = strlen(hdmi_status_buffer);
-                res_changed = true;
-            }
+            // Decided below, once fps and HDCP are known too.
+            res_changed = true;
             break;
         case ERROR_RES:
-            last_width = 0;
-            last_height = 0;
+            lt6911_reset_last_mode();
             snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "error res\n");
             snprintf(hdmi_width_buffer, sizeof(hdmi_width_buffer), "%d\n", 0);
             snprintf(hdmi_height_buffer, sizeof(hdmi_height_buffer), "%d\n", 0);
@@ -2712,7 +2779,7 @@ void hdmi_change_process(u8 hdmi_state)
         printk(KERN_INFO "HDMI resolution: %d x %d\n", width, height);
 
         // Get HDCP mode
-        lt6911_get_hdcp_mode(&hdcp_mode);
+        hdcp_known = lt6911_get_hdcp_mode(&hdcp_mode) == 0;
         switch (hdcp_mode)
         {
         case 0x00:
@@ -2737,10 +2804,38 @@ void hdmi_change_process(u8 hdmi_state)
         printk(KERN_INFO "HDCP mode: %s\n", hdmi_hdcp_buffer);
 
         // Get CSI fps
-        lt6911_get_csi_fps(&fps, width, height);
+        fps_known = lt6911_get_csi_fps(&fps, width, height) == 0;
         snprintf(hdmi_fps_buffer, sizeof(hdmi_fps_buffer), "%d\n", fps);
         hdmi_fps_buffer_length = strlen(hdmi_fps_buffer);
         printk(KERN_INFO "HDMI FPS: %d\n", fps);
+
+        /*
+         * Debounce only a truly unchanged mode: the INT line can storm with
+         * the same mode, and every notification restarts the userspace
+         * pipeline. W x H alone is not enough (60 -> 30 Hz, an HDCP change).
+         * The fps is measured from the pixel clock, so it may wobble by one;
+         * a field that failed to read never counts as a change.
+         */
+        if (res_changed && width > 0 && height > 0 &&
+            width == last_width && height == last_height &&
+            (!fps_known || last_fps == LT6911_MODE_UNKNOWN ||
+             abs((int)fps - (int)last_fps) <= LT6911_FPS_TOLERANCE) &&
+            (!hdcp_known || last_hdcp == LT6911_MODE_UNKNOWN ||
+             hdcp_mode == last_hdcp)) {
+            res_changed = false;
+        }
+        if (res_changed) {
+            last_width = width;
+            last_height = height;
+            snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "new res\n");
+            hdmi_status_buffer_length = strlen(hdmi_status_buffer);
+        }
+        // Keep the reported baseline while debounced, so a slow drift
+        // is still measured against what userspace was last told.
+        if (res_changed || last_fps == LT6911_MODE_UNKNOWN)
+            last_fps = fps_known ? fps : LT6911_MODE_UNKNOWN;
+        if (res_changed || last_hdcp == LT6911_MODE_UNKNOWN)
+            last_hdcp = hdcp_known ? hdcp_mode : LT6911_MODE_UNKNOWN;
 
         if (res_changed) {
             atomic_inc(&lt6911_ctx.status);
@@ -2748,8 +2843,7 @@ void hdmi_change_process(u8 hdmi_state)
         }
 
     } else if (hdmi_state == 0) {
-        last_width = 0;
-        last_height = 0;
+        lt6911_reset_last_mode();
         // HDMI signal has disappeared
         snprintf(hdmi_status_buffer, sizeof(hdmi_status_buffer), "disappear\n");
         snprintf(hdmi_width_buffer, sizeof(hdmi_width_buffer), "%d\n", 0);
@@ -2856,11 +2950,17 @@ static void get_hdmi_info_handler(struct work_struct *work)
         return;
     }
 
-    if (lt6911_enable() < 0) return;
+    mutex_lock(&lt6911_xfer_mutex);
+    // A /proc power-off may have won the race for the lock.
+    if (!lt6911_powered)
+        goto out;
+
+    if (lt6911_enable() < 0)
+        goto out;
     if (lt6911_disable_watchdog() < 0) {
         printk(KERN_ERR "Failed to disable watchdog\n");
         lt6911_disable();
-        return;
+        goto out;
     }
 
     // check HDMI state
@@ -2868,7 +2968,7 @@ static void get_hdmi_info_handler(struct work_struct *work)
     if (ret < 0) {
         printk(KERN_ERR "Failed to get HDMI state\n");
         lt6911_disable();
-        return;
+        goto out;
     }
     pr_debug("HDMI signal state: 0x%02x\n", signal_state);
 
@@ -2900,9 +3000,9 @@ static void get_hdmi_info_handler(struct work_struct *work)
     if (signal_state & 0x02) audio_change_process(1); // Audio signal is stable
     else                     audio_change_process(0); // Audio signal is disappearing
 
-    if (lt6911_disable() < 0) return;
-
-    return;
+    lt6911_disable();
+out:
+    mutex_unlock(&lt6911_xfer_mutex);
 }
 
 // Interupt IRQ
@@ -2980,9 +3080,14 @@ static int __init lt6911_manage_init(void)
         return -ENODEV;
     }
 
+    // The INT line is live from here on, so hold the transaction lock
+    // through every chip access of the init sequence.
+    mutex_lock(&lt6911_xfer_mutex);
+
     // check chip register
     ret = check_chip_register();
     if (ret < 0) {
+        mutex_unlock(&lt6911_xfer_mutex);
         printk(KERN_ERR "This module only supports LT6911UXC/LT6911C/LT6911D chip\n");
         i2c_unregister_device(client);
         gpio_exit();
@@ -3019,6 +3124,7 @@ static int __init lt6911_manage_init(void)
     msleep(200);
     lt86102_pwr_ctrl(1);  // Power on the LT86102UXC (HPD high)
     msleep(300);
+    mutex_unlock(&lt6911_xfer_mutex);
     schedule_work(&get_hdmi_info_work);
 
     // create proc info files only after hardware and buffers are fully initialized
@@ -3049,7 +3155,7 @@ module_init(lt6911_manage_init);
 module_exit(lt6911_manage_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.0.33");
+MODULE_VERSION("0.0.34");
 MODULE_AUTHOR("Z2Z-BuGu");
 MODULE_AUTHOR("916BGAI");
 MODULE_DESCRIPTION("NanoKVM-Pro HDMI Module Management");
