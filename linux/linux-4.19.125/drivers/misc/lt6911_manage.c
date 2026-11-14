@@ -64,6 +64,23 @@ static unsigned long lt6911_power_on_jiffies = 0;
 #define LT6911_POR_SETTLE_MS 250
 static DEFINE_MUTEX(lt6911_i2c_mutex);
 
+/*
+ * No-signal fallback poll. The INT line reports signal lock; the poll only
+ * covers a missed interrupt, so it backs off while the source stays dark
+ * (target off or asleep, the normal idle state of a KVM) instead of waking
+ * the chip, the I2C bus and every /proc poller once a second forever.
+ */
+#define LT6911_NOSIG_POLL_MIN_MS 1000
+#define LT6911_NOSIG_POLL_MAX_MS 8000
+static unsigned int nosig_poll_ms = LT6911_NOSIG_POLL_MIN_MS;
+/* Last signal state reported to userspace: -1 unknown, 0 no signal, 1 locked. */
+static int last_signal_state = -1;
+
+/* Loop-out state applied at load, so a disabled passthrough is never briefly on. */
+static int loopout = 1;
+module_param(loopout, int, 0444);
+MODULE_PARM_DESC(loopout, "HDMI loop-out (passthrough) state at load: 1 on (default), 0 off");
+
 void lt6911_force_resolution(u16 width, u16 height, int fps);
 static struct work_struct get_hdmi_info_work;
 static struct delayed_work hdmi_poll_work;
@@ -1090,6 +1107,8 @@ int lt6911_pwr_ctrl(int pwr_en)
     old_offset = 0xff;
     if (pwr_en) {
         lt6911_power_on_jiffies = jiffies;
+        WRITE_ONCE(nosig_poll_ms, LT6911_NOSIG_POLL_MIN_MS);
+        WRITE_ONCE(last_signal_state, -1);
         lt6911_powered = true;
         // Power on the LT6911UXC
         ret = gpio_direction_output(PWR_PIN, 1);
@@ -1399,8 +1418,6 @@ int gpio_init(void)
             gpio_free(HDMI_TXI_PIN);
             return ret;
         }
-        // default allow HDMI LOOP OUT
-        set_hdmi_loopout(1);
     }
 
     if (LOOP_CTRL_PIN >= 0) {
@@ -1417,6 +1434,11 @@ int gpio_init(void)
             return ret;
         }
     }
+
+    // Apply the requested loop-out state once both control pins are ours
+    // (default on, as before; kvmcomm passes loopout=0 when passthrough is off).
+    if (HDMI_TXO_PIN >= 0 && LOOP_CTRL_PIN >= 0)
+        set_hdmi_loopout(loopout ? 1 : 0);
 
     pinmux_register_init();
 
@@ -2848,19 +2870,29 @@ static void get_hdmi_info_handler(struct work_struct *work)
         lt6911_disable();
         return;
     }
-    printk(KERN_INFO "HDMI signal state: 0x%02x\n", signal_state);
+    pr_debug("HDMI signal state: 0x%02x\n", signal_state);
 
     if (signal_state & 0x01) {
+        WRITE_ONCE(last_signal_state, 1);
+        WRITE_ONCE(nosig_poll_ms, LT6911_NOSIG_POLL_MIN_MS);
         if (force_height != -1 && force_width != -1) {
             lt6911_force_resolution(force_width, force_height, force_fps);
         } else {
             hdmi_change_process(1); // HDMI signal is stable
         }
     } else {
-        hdmi_change_process(0); // HDMI signal is disappearing
-        // Automatically retry detection after 1 second if signal not locked yet
+        unsigned int delay = READ_ONCE(nosig_poll_ms);
+
+        // Report only the transition to "no signal"; repeating it would wake
+        // every poller each time the fallback poll runs.
+        if (READ_ONCE(last_signal_state) != 0) {
+            WRITE_ONCE(last_signal_state, 0);
+            hdmi_change_process(0); // HDMI signal is disappearing
+        }
+        // Retry in case the lock interrupt is missed, backing off while dark.
         if (lt6911_powered) {
-            schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(1000));
+            schedule_delayed_work(&hdmi_poll_work, msecs_to_jiffies(delay));
+            WRITE_ONCE(nosig_poll_ms, min_t(unsigned int, delay * 2, LT6911_NOSIG_POLL_MAX_MS));
         }
     }
 
@@ -2886,6 +2918,7 @@ static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
         return IRQ_HANDLED;
     }
 
+    WRITE_ONCE(nosig_poll_ms, LT6911_NOSIG_POLL_MIN_MS);
     schedule_work(&get_hdmi_info_work);
     return IRQ_HANDLED;
 }
@@ -3016,7 +3049,7 @@ module_init(lt6911_manage_init);
 module_exit(lt6911_manage_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.0.32");
+MODULE_VERSION("0.0.33");
 MODULE_AUTHOR("Z2Z-BuGu");
 MODULE_AUTHOR("916BGAI");
 MODULE_DESCRIPTION("NanoKVM-Pro HDMI Module Management");
